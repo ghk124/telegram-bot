@@ -27,7 +27,7 @@ if not GEMINI_KEY:
 
 # تنظیمات هوش مصنوعی Gemini (SDK جدید google-genai)
 client = genai.Client(api_key=GEMINI_KEY)
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "models/gemini-1.5-flash"
 
 # شخصیت خودمونی و باحال ربات برای همه‌ی پاسخ‌های هوش مصنوعی
 PERSONA = (
