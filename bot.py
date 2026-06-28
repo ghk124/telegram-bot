@@ -1,322 +1,157 @@
-"""
-ربات حرفه‌ای بامزه فارسی
-با قابلیت Gemini AI، آنالیز عکس و مدیریت گروه
-"""
-
-import logging
-import random
 import os
-import google.generativeai as genai
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ChatPermissions
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import google.generativeai as genai
 
-# ====================================================
-# 🔴 تنظیمات توکن‌ها (مستقیم یا از طریق سرور)
-# ====================================================
-TOKEN = os.environ.get("TOKEN") or "توکن_تلگرام_تو"
-GEMINI_KEY = os.environ.get("GEMINI_KEY") or "توکن_جمینای_تو"
+# دریافت توکن‌ها از بخش Variables در Railway
+TOKEN = os.getenv("TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_KEY")
 
-# تنظیم Gemini
+# تنظیمات هوش مصنوعی Gemini
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-logging.basicConfig(level=logging.INFO)
+# دیتابیس ساده در حافظه برای مدیریت گروه
+user_warnings = {}
+muted_users = set()
 
-# ========================
-# دیتابیس جوک‌ها و پیام‌ها
-# ========================
-JOKES = [
-    "یه نفر رفت دکتر گفت: دکتر همه بهم میگن دروغگو!\nدکتر گفت: باور نمیکنم 😂",
-    "چرا برنامه‌نویس‌ها عینک میزنن؟ چون C# میزنن! 🤓",
-    "یه بادمجون رفت دکتر گفت: دکتر همه بهم میگن بادمجون!\nدکتر گفت: خب بادمجون! 😅",
-    "به استاد گفتم نمره‌ام رو بده!\nگفت: داری!\nگفتم: چند؟\nگفت: داری... داری تجدید میشی 😭",
-    "چرا دریا شوره؟ چون ماهی‌ها توش عرق میکنن! 🐟",
-]
-
-GREET_REPLIES = [
-    "سلام عزیزم! چطوری؟ 😁",
-    "اوه اوه کی اومد! سلام 👋",
-    "یا علی! سلام داداش 😄",
-]
-
-# ========================
-# منوها
-# ========================
-def main_menu():
-    keyboard = [
-        [KeyboardButton("😂 جوک"), KeyboardButton("🎮 بازی‌ها")],
-        [KeyboardButton("🎲 تاس"), KeyboardButton("🪙 شیر یا خط")],
-        [KeyboardButton("📊 آمار من"), KeyboardButton("📋 راهنما")],
-        [KeyboardButton("🔮 فال"), KeyboardButton("🤖 چت با AI")],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def games_menu():
-    keyboard = [
-        [KeyboardButton("🔢 بازی عدد"), KeyboardButton("✂️ سنگ کاغذ قیچی")],
-        [KeyboardButton("🧠 معما"), KeyboardButton("🔤 کلمه بازی")],
-        [KeyboardButton("🏠 برگشت به منو")],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-# ========================
-# دستورات اصلی
-# ========================
+# دستور /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    name = user.first_name or "دوست"
-    context.user_data["message_count"] = 0
-    context.user_data["game"] = None
-    context.user_data["ai_mode"] = False
-
+    keyboard = [
+        [InlineKeyboardButton("🤖 بخش هوش مصنوعی", callback_data='ai_mode')],
+        [InlineKeyboardButton("📜 راهنمای دستورات", callback_data='help_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"سلام {name}! 👋\n\n"
-        "من ربات بامزه + هوش مصنوعی جمینای هستم 🤖✨\n"
-        "میتونی باهام حرف بزنی، بازی کنی، یا عکس بفرستی تا آنالیز کنم!\n\n"
-        "از منوی پایین شروع کن 👇",
-        reply_markup=main_menu()
+        f"سلام {update.effective_user.first_name} عزیز! به ربات مدیریت گروه و هوش مصنوعی خوش آمدی.\n"
+        "یک گزینه را انتخاب کن:",
+        reply_markup=reply_markup
     )
 
+# دستور /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📋 *راهنمای کامل ربات*\n\n"
-        "🤖 *هوش مصنوعی*\n"
-        "/ai — روشن/خاموش کردن AI\n"
-        "🖼️ عکس بفرست — آنالیز میکنم!\n\n"
-        "😂 *جوک و سرگرمی*\n"
-        "/joke — جوک تصادفی\n"
-        "/flip — شیر یا خط\n"
-        "/roll — تاس بنداز\n"
-        "/fal — فال بگیر\n\n"
-        "🎮 *بازی‌ها*\n"
-        "/guess — حدس عدد\n"
-        "/rps — سنگ کاغذ قیچی\n"
-        "/riddle — معما\n\n"
-        "👮 *مدیریت گپ (ادمین)*\n"
-        "/ban /mute /unmute /warn\n\n"
-        "یا فقط باهام حرف بزن! 😄"
+        "📜 **دستورات ربات:**\n\n"
+        "🔹 `/start` - شروع ربات و منو\n"
+        "🔹 `/help` - نمایش این راهنما\n"
+        "🔹 `/ai <متن>` - صحبت مستقیم با هوش مصنوعی\n\n"
+        "👮‍♂️ **دستورات مدیریتی:**\n"
+        "🔸 `/ban` - مسدود کردن کاربر (ریپلای)\n"
+        "🔸 `/mute` - سکوت کاربر (ریپلای)\n"
+        "🔸 `/unmute` - لغو سکوت (ریپلای)\n"
+        "🔸 `/warn` - دادن اخطار (ریپلای)"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=main_menu())
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
-async def ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current = context.user_data.get("ai_mode", False)
-    context.user_data["ai_mode"] = not current
-
-    if not current:
-        await update.message.reply_text("🤖 حالت AI روشن شد!\nالان هر چی بنویسی Gemini جواب میده 😄\nبرای خاموش کردن /ai بزن")
-    else:
-        await update.message.reply_text("🔴 حالت AI خاموش شد!", reply_markup=main_menu())
-
-
-# ========================
-# بخش هوش مصنوعی (Gemini)
-# ========================
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 دارم عکست رو آنالیز میکنم...")
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        file_bytes = await file.download_as_bytearray()
-
-        import PIL.Image
-        import io
-        img = PIL.Image.open(io.BytesIO(file_bytes))
-
-        caption = update.message.caption or "این عکس رو برام توضیح بده به فارسی"
-        response = model.generate_content([caption, img])
-        await update.message.reply_text(f"🖼️ *آنالیز عکس:*\n\n{response.text}", parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text("😅 نتونستم عکس رو آنالیز کنم! دوباره امتحان کن.")
-
-async def chat_with_gemini(update: Update, text: str):
-    try:
-        prompt = f"تو یه ربات تلگرام بامزه فارسی هستی. پاسخ کوتاه، دوستانه و همراه با ایموجی بده. پیام کاربر: {text}"
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception:
-        return "😅 یه مشکلی توی ارتباط با جمینای پیش اومد!"
-
-
-# ========================
-# سرگرمی‌ها و بازی‌ها
-# ========================
-async def joke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(random.choice(JOKES))
-
-async def flip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(random.choice(["🪙 شیر!", "🪙 خط!"]))
-
-async def roll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    num = random.randint(1, 6)
-    faces = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣"]
-    await update.message.reply_text(f"🎲 تاس انداختم: {faces[num-1]}")
-
-async def fal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fals = ["🔮 امروز یه خبر خوب میشنوی!", "🔮 یکی داره بهت فکر میکنه 😏", "🔮 این هفته پول بهت میرسه 💰"]
-    await update.message.reply_text(random.choice(fals))
-
-async def guess_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["game"] = "guess"
-    context.user_data["guess_number"] = random.randint(1, 100)
-    context.user_data["guess_tries"] = 0
-    await update.message.reply_text("🔢 یه عدد بین ۱ تا ۱۰۰ انتخاب کردم! حدس بزن 🤔")
-
-async def rps_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["game"] = "rps"
-    await update.message.reply_text("✂️ انتخاب کن:\n🪨 سنگ\n📄 کاغذ\n✂️ قیچی")
-
-async def riddle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    riddles = [("هر چی بیشتر ازش بگیری بزرگتر میشه. چیه؟", "گودال"), ("دندون داره ولی نمیتونه بخوره. چیه؟", "شانه")]
-    r = random.choice(riddles)
-    context.user_data["game"] = "riddle"
-    context.user_data["riddle_answer"] = r[1]
-    await update.message.reply_text(f"🧠 *معما:*\n\n{r[0]}\n\nجواب بده! (یا بنویس: جواب)", parse_mode="Markdown")
-
-
-# ========================
-# ناظمی و ادمین گروه
-# ========================
+# بررسی ادمین بودن کاربر در گروه
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if update.effective_chat.type == "private": return True
-    member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    return member.status in ["administrator", "creator"]
+    if update.message.chat.type == "private":
+        return False
+    member = await context.bot.get_chat_member(update.message.chat_id, update.effective_user.id)
+    return member.status in ['creator', 'administrator']
 
+# دستور بن کردن (/ban)
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌های گروه است!")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ لطفا این دستور را روی پیام کاربر مورد نظر ریپلای کنید.")
+        return
+    target_user = update.message.reply_to_message.from_user
     try:
-        await update.effective_chat.ban_member(user.id)
-        await update.message.reply_text(f"🔨 {user.first_name} بن شد!")
-    except Exception: pass
+        await context.bot.ban_chat_member(update.message.chat_id, target_user.id)
+        await update.message.reply_text(f"🔒 کاربر {target_user.first_name} با موفقیت بن شد.")
+    except Exception:
+        await update.message.reply_text("❌ خطایی در مسدود سازی رخ داد.")
 
+# دستور سکوت (/mute)
 async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
-    try:
-        await update.effective_chat.restrict_member(user.id, ChatPermissions(can_send_messages=False))
-        await update.message.reply_text(f"🔇 {user.first_name} میوت شد!")
-    except Exception: pass
+    if not await is_admin(update, context):
+         await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+         return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ روی پیام کاربر ریپلای کنید.")
+        return
+    target_user = update.message.reply_to_message.from_user
+    muted_users.add(target_user.id)
+    await update.message.reply_text(f"🔇 کاربر {target_user.first_name} در حالت سکوت قرار گرفت.")
 
+# دستور لغو سکوت (/unmute)
 async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
-    try:
-        await update.effective_chat.restrict_member(user.id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
-        await update.message.reply_text(f"🔊 {user.first_name} آنمیوت شد!")
-    except Exception: pass
+    if not await is_admin(update, context):
+        return
+    if not update.message.reply_to_message:
+        return
+    target_user = update.message.reply_to_message.from_user
+    if target_user.id in muted_users:
+        muted_users.remove(target_user.id)
+        await update.message.reply_text(f"🔊 کاربر {target_user.first_name} مجدداً اجازه ارسال پیام دارد.")
 
+# دستور اخطار (/warn)
 async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context): return
-    if not update.message.reply_to_message: return
-    user = update.message.reply_to_message.from_user
-    warns = context.bot_data.get(f"warn_{user.id}", 0) + 1
-    context.bot_data[f"warn_{user.id}"] = warns
-    if warns >= 3:
+    if not await is_admin(update, context) or not update.message.reply_to_message:
+        return
+    target_user = update.message.reply_to_message.from_user
+    user_id = target_user.id
+    user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
+    
+    if user_warnings[user_id] >= 3:
         try:
-            await update.effective_chat.ban_member(user.id)
-            context.bot_data[f"warn_{user.id}"] = 0
-            await update.message.reply_text(f"🚫 {user.first_name} بن شد (اخطار ۳/۳)!")
-        except Exception: pass
+            await context.bot.ban_chat_member(update.message.chat_id, user_id)
+            await update.message.reply_text(f"🔒 کاربر {target_user.first_name} به دلیل دریافت ۳ اخطار بن شد.")
+            user_warnings[user_id] = 0
+        except Exception:
+            await update.message.reply_text("❌ خطا در بن کردن کاربر اخراجی.")
     else:
-        await update.message.reply_text(f"⚠️ {user.first_name} اخطار {warns}/3!")
+        await update.message.reply_text(f"⚠️ کاربر {target_user.first_name} یک اخطار دریافت کرد. اخطارها: {user_warnings[user_id]}/3")
 
+# پردازش دستور متنی هوش مصنوعی (/ai)
+async def ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_prompt = " ".join(context.args)
+    if not user_prompt:
+        await update.message.reply_text("❌ لطفاً پیام خود را بعد از دستور وارد کنید. مثال:\n`/ai چطور پایتون یاد بگیرم؟`")
+        return
+    sent_msg = await update.message.reply_text("🤔 در حال پردازش توسط Gemini...")
+    try:
+        response = model.generate_content(user_prompt)
+        await context.bot.edit_message_text(chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=response.text)
+    except Exception:
+        await context.bot.edit_message_text(chat_id=update.message.chat_id, message_id=sent_msg.message_id, text="❌ خطایی در دریافت پاسخ از هوش مصنوعی رخ داد.")
 
-# ========================
-# لوپ و پردازش بازی‌ها
-# ========================
-async def process_game(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
-    game = context.user_data.get("game")
-    if not game: return False
+# پردازش تصاویر فرستاده شده به ربات
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id in muted_users:
+        await update.message.delete()
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    await photo_file.download_to_drive("user_photo.jpg")
+    sent_msg = await update.message.reply_text("👁️ در حال تحلیل عکس توسط هوش مصنوعی...")
+    try:
+        import PIL.Image
+        img = PIL.Image.open("user_photo.jpg")
+        caption = update.message.caption if update.message.caption else "این تصویر را تحلیل کن"
+        response = model.generate_content([caption, img])
+        await context.bot.edit_message_text(chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=response.text)
+    except Exception:
+        await context.bot.edit_message_text(chat_id=update.message.chat_id, message_id=sent_msg.message_id, text="❌ خطایی در پردازش تصویر پیش آمد.")
 
-    if game == "guess" and text.isdigit():
-        num = int(text)
-        target = context.user_data["guess_number"]
-        context.user_data["guess_tries"] += 1
-        if num == target:
-            context.user_data["game"] = None
-            context.user_data["wins"] = context.user_data.get("wins", 0) + 1
-            await update.message.reply_text(f"🎉 آفرین! {target} بود! برد شما ثبت شد 🏆")
-        elif num < target: await update.message.reply_text("⬆️ بزرگتر!")
-        else: await update.message.reply_text("⬇️ کوچیکتر!")
-        return True
-
-    elif game == "rps":
-        choices = {"سنگ": "🪨", "کاغذ": "📄", "قیچی": "✂️"}
-        wins = {"سنگ": "قیچی", "کاغذ": "سنگ", "قیچی": "کاغذ"}
-        user_choice = next((k for k in choices if k in text), None)
-        if user_choice:
-            bot_choice = random.choice(["سنگ", "کاغذ", "قیچی"])
-            if user_choice == bot_choice: result = "مساوی! 🤝"
-            elif wins[user_choice] == bot_choice:
-                result = "بردی! 🏆"
-                context.user_data["wins"] = context.user_data.get("wins", 0) + 1
-            else: result = "باختی! 😂"
-            context.user_data["game"] = None
-            await update.message.reply_text(f"تو: {choices[user_choice]}\nمن: {choices[bot_choice]}\n\n{result}")
-            return True
-
-    elif game == "riddle":
-        ans = context.user_data.get("riddle_answer", "")
-        if "جواب" in text:
-            context.user_data["game"] = None
-            await update.message.reply_text(f"جواب: {ans} 🧠")
-            return True
-        elif ans in text:
-            context.user_data["game"] = None
-            context.user_data["wins"] = context.user_data.get("wins", 0) + 1
-            await update.message.reply_text(f"🎉 آفرین درست بود! جواب: {ans}")
-            return True
-    return False
-
-
-# ========================
-# متن‌ها و منوی اصلی
-# ========================
+# فیلتر پیام‌های کاربران بیصدا شده
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not text: return
-    text_lower = text.lower()
+    if update.message.from_user.id in muted_users:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
 
-    if text == "🏠 برگشت به منو":
-        context.user_data["game"] = None
-        await update.message.reply_text("برگشتیم! 😄", reply_markup=main_menu())
-        return
-
-    if await process_game(update, context, text_lower): return
-
-    if context.user_data.get("ai_mode"):
-        reply = await chat_with_gemini(update, text)
-        await update.message.reply_text(reply)
-        return
-
-    if text == "😂 جوک": await joke(update, context)
-    elif text == "🎲 تاس": await roll(update, context)
-    elif text == "🪙 شیر یا خط": await flip(update, context)
-    elif text == "🔮 فال": await fal(update, context)
-    elif text == "🤖 چت با AI":
-        context.user_data["ai_mode"] = True
-        await update.message.reply_text("🤖 حالت AI روشن شد! بنویس تا Gemini جوابت رو بده.")
-    elif text == "🎮 بازی‌ها": await update.message.reply_text("کدوم بازی؟ 🎮", reply_markup=games_menu())
-    elif text == "🔢 بازی عدد": await guess_game(update, context)
-    elif text == "✂️ سنگ کاغذ قیچی": await rps_game(update, context)
-    elif text == "🧠 معما": await riddle(update, context)
-    elif any(g in text_lower for g in ["سلام", "درود", "hi", "hello"]):
-        await update.message.reply_text(random.choice(GREET_REPLIES))
-    elif random.random() < 0.15:
-        reply = await chat_with_gemini(update, text)
-        await update.message.reply_text(reply)
-
-# ========================
-# رانر اصلی
-# ========================
+# تابع اصلی اجرای ربات
 def main():
-    print("🤖 ربات با هوش مصنوعی Gemini در حال روشن شدن است...")
+    print("🤖 ربات مدیریت گروه و هوش مصنوعی در حال روشن شدن است...")
+    
     app = Application.builder().token(TOKEN).build()
-
+    
+    # ثبت هندلرهای ربات
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ai", ai_mode))
@@ -327,8 +162,10 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("✅ آماده‌ست! 🚀")
-    app.run_polling()
+    print("✅ ربات بدون مشکل شبکه متصل شد! در حال شنیدن پیام‌ها... 🚀")
+    
+    # اجرای مستقیم و پایدار پولینگ در ریلووی
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
