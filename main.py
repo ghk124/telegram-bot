@@ -26,8 +26,8 @@ if not GEMINI_KEY:
     raise RuntimeError("متغیر محیطی GEMINI_KEY ست نشده! آن را در Railway > Variables اضافه کنید.")
 
 # تنظیمات هوش مصنوعی Gemini (SDK جدید google-genai)
-client = genai.Client(api_key=GEMINI_KEY, http_options={'api_version': 'v1'})
-MODEL_NAME = "gemini-1.5-flash"
+client = genai.Client(api_key=GEMINI_KEY)
+MODEL_NAME = "gemini-2.5-flash"
 
 # شخصیت خودمونی و باحال ربات برای همه‌ی پاسخ‌های هوش مصنوعی
 PERSONA = (
