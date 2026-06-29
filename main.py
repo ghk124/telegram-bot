@@ -1,8 +1,15 @@
 import os
 import re
+import json
 import random
 import uuid
+import asyncio
+import time
 from collections import deque
+from datetime import date, timedelta
+
+import jdatetime
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -19,6 +26,7 @@ import PIL.Image
 # دریافت توکن‌ها از بخش Variables در Railway
 TOKEN = os.getenv("TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
+BRSAPI_KEY = os.getenv("BRSAPI_KEY")  # اختیاری، فقط برای دستور /price لازمه
 
 if not TOKEN:
     raise RuntimeError("متغیر محیطی TOKEN ست نشده! آن را در Railway > Variables اضافه کنید.")
@@ -27,11 +35,18 @@ if not GEMINI_KEY:
 
 # تنظیمات هوش مصنوعی Gemini (SDK جدید google-genai)
 client = genai.Client(api_key=GEMINI_KEY)
-MODEL_NAME = "gemini-2.5-flash"
+# از flash-lite استفاده می‌کنیم چون سهمیه‌ی رایگانش بیشتره (۱۵ درخواست/دقیقه و ~۱۰۰۰ درخواست/روز
+# در مقابل ۱۰ درخواست/دقیقه و ~۲۵۰ درخواست/روز برای gemini-2.5-flash معمولی)
+MODEL_NAME = "gemini-2.5-flash-lite"
+
+# حداقل فاصله‌ی زمانی بین درخواست‌ها (ثانیه) تا زیر سقف رایگان بمونیم و به خطای ۴۲۹ نخوریم
+MIN_SECONDS_BETWEEN_CALLS = 4.2
+_request_lock = asyncio.Lock()
+_last_request_time = 0.0
 
 # شخصیت خودمونی و باحال ربات برای همه‌ی پاسخ‌های هوش مصنوعی
 PERSONA = (
-    "تو یه دستیار هوش مصنوعی خودمونی، باحال و دوست‌داشتنی برای یه گروه تلگرامی هستی. "
+    "تو یه دستیار هوش مصنوعی خودمونی، باحال و دوست‌داشتنی برای یه گروه تلگرامی ایرانی هستی. "
     "همیشه با لحن صمیمی، محاوره‌ای و فارسیِ روزمره جواب بده (نه رسمی و کتابی). "
     "گاهی شوخی و طعنه‌ی بامزه و دوستانه بزن، ولی هیچ‌وقت توهین یا بی‌ادبی نکن. "
     "اگه ازت خواستن چیزی رو تحلیل کنی، تحلیل دقیق، مفید و قابل فهم بده. "
@@ -42,15 +57,139 @@ PERSONA = (
 GENERATE_CONFIG = types.GenerateContentConfig(system_instruction=PERSONA)
 
 # --- دیتابیس ساده در حافظه (RAM) ---
-# توجه: همه‌ی این دیتاها با ری‌استارت شدن ربات (مثلا روی Railway) از بین می‌رن.
+# توجه: اگه DATABASE_URL ست نشده باشه، همه‌ی این دیتاها با ری‌استارت ربات از بین می‌رن.
+# اگه یه دیتابیس Postgres به پروژه‌ی Railway اضافه کنی (که DATABASE_URL رو خودکار می‌سازه)،
+# این دیتاها بعد از هر ری‌استارت یا دیپلوی جدید هم حفظ می‌شن.
 user_warnings = {}
 muted_users = set()
 user_names = {}             # user_id -> نیک‌نیمی که خودش انتخاب کرده (اختیاری)
 user_tags = {}               # user_id -> لقب/نشان ویژه‌ای که ادمین بهش داده (مثل VIP، مدیر)
 active_guess_games = {}      # chat_id -> {"number": int, "attempts": int}
 active_math_games = {}       # chat_id -> {"answer": int, "question": str}
+active_dooz_games = {}       # chat_id -> {"board": list, "player_x": int, "player_o": int|None, "turn": "X"/"O"}
 user_message_history = {}    # user_id -> deque آخرین پیام‌ها (حافظه‌ی کوتاه‌مدت برای تحلیل)
 learned_facts = {}           # کلیدواژه (lower) -> جوابی که ادمین یاد داده (بخش یادگیریِ فعال)
+bad_words = set()            # کلماتی که ادمین برای فیلتر فحاشی/کلمات ممنوعه اضافه کرده
+link_filter_enabled = True   # فیلتر لینک برای غیرادمین‌ها (با /togglelinks خاموش/روشن می‌شه)
+user_message_times = {}      # user_id -> deque زمان آخرین پیام‌ها (برای تشخیص اسپم/فلود)
+
+SPAM_WINDOW_SECONDS = 8      # اگه توی این بازه...
+SPAM_MESSAGE_THRESHOLD = 5   # ...به این تعداد پیام برسه، اسپم تشخیص داده می‌شه
+URL_PATTERN = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
+
+# ---------- لایه‌ی ذخیره‌ی دائمی (اختیاری، فقط اگه DATABASE_URL ست شده باشه) ----------
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
+
+def _db_conn():
+    if not DATABASE_URL or not psycopg2:
+        return None
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        print(f"⚠️ اتصال به دیتابیس برقرار نشد، روی حافظه‌ی موقت ادامه می‌دیم: {e}")
+        return None
+
+
+def init_db():
+    conn = _db_conn()
+    if not conn:
+        return
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS bot_data (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+    finally:
+        conn.close()
+
+
+def db_save(key: str, data):
+    conn = _db_conn()
+    if not conn:
+        return
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_data (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, json.dumps(data)),
+            )
+    except Exception as e:
+        print(f"⚠️ ذخیره‌ی {key} توی دیتابیس شکست خورد: {e}")
+    finally:
+        conn.close()
+
+
+def db_load(key: str, default):
+    conn = _db_conn()
+    if not conn:
+        return default
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_data WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return json.loads(row[0]) if row else default
+    except Exception as e:
+        print(f"⚠️ بارگذاری {key} از دیتابیس شکست خورد: {e}")
+        return default
+    finally:
+        conn.close()
+
+
+def save_warnings():
+    db_save("user_warnings", {str(k): v for k, v in user_warnings.items()})
+
+
+def save_muted():
+    db_save("muted_users", list(muted_users))
+
+
+def save_names():
+    db_save("user_names", {str(k): v for k, v in user_names.items()})
+
+
+def save_tags():
+    db_save("user_tags", {str(k): v for k, v in user_tags.items()})
+
+
+def save_learned():
+    db_save("learned_facts", learned_facts)
+
+
+def save_badwords():
+    db_save("bad_words", list(bad_words))
+
+
+def save_settings():
+    db_save("settings", {"link_filter_enabled": link_filter_enabled})
+
+
+def load_persisted_state():
+    """اگه دیتابیس وصل باشه، همه‌ی دیتاهای ذخیره‌شده رو موقع روشن شدن ربات برمی‌گردونه."""
+    global link_filter_enabled
+    if not DATABASE_URL:
+        print("ℹ️ DATABASE_URL ست نشده؛ ربات با حافظه‌ی موقت (RAM) کار می‌کنه.")
+        return
+    if not psycopg2:
+        print("⚠️ psycopg2 نصب نشده؛ ذخیره‌ی دائمی غیرفعاله.")
+        return
+
+    init_db()
+    user_warnings.update({int(k): v for k, v in db_load("user_warnings", {}).items()})
+    muted_users.update(int(u) for u in db_load("muted_users", []))
+    user_names.update({int(k): v for k, v in db_load("user_names", {}).items()})
+    user_tags.update({int(k): v for k, v in db_load("user_tags", {}).items()})
+    learned_facts.update(db_load("learned_facts", {}))
+    bad_words.update(db_load("bad_words", []))
+    settings = db_load("settings", {})
+    link_filter_enabled = settings.get("link_filter_enabled", True)
+    print("✅ دیتای قبلی از دیتابیس بارگذاری شد.")
 
 GREETING_WORDS = {
     "سلام", "سلامم", "سلامی", "های", "هلو", "درود", "سلام!", "سلام،",
@@ -59,13 +198,53 @@ GREETING_WORDS = {
 
 HISTORY_LIMIT = 8
 
+PERSIAN_LETTERS = list("ابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهی")
+PERSIAN_MONTHS = [
+    "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
+    "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند",
+]
+# اندیس‌ها مطابق date.weekday() پایتون: دوشنبه=0 ... یکشنبه=6
+PERSIAN_WEEKDAYS = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه"]
+PERSIAN_DIGITS = "۰۱۲۳۴۵۶۷۸۹"
 
-def ask_ai(prompt: str) -> str:
-    """یک تابع کمکی برای صدا زدن Gemini با شخصیت خودمونی."""
-    response = client.models.generate_content(
-        model=MODEL_NAME, contents=prompt, config=GENERATE_CONFIG
-    )
-    return response.text
+
+def fa_num(n) -> str:
+    return "".join(PERSIAN_DIGITS[int(ch)] if ch.isdigit() else ch for ch in str(n))
+
+
+async def generate_content_safe(contents):
+    """
+    صدا زدن Gemini با ۲ محافظ:
+    ۱. قبل از هر درخواست، اگه لازم باشه کمی صبر می‌کنه تا از سقف درخواست در دقیقه رد نشیم.
+    ۲. اگه با وجود این به خطای ۴۲۹ (محدودیت) خوردیم، چندبار با فاصله بیشتر دوباره امتحان می‌کنه.
+    """
+    global _last_request_time
+    async with _request_lock:
+        wait = MIN_SECONDS_BETWEEN_CALLS - (time.monotonic() - _last_request_time)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request_time = time.monotonic()
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME, contents=contents, config=GENERATE_CONFIG
+            )
+            return response.text
+        except Exception as e:
+            last_error = e
+            message = str(e)
+            if "429" in message or "RESOURCE_EXHAUSTED" in message:
+                await asyncio.sleep(6 * (attempt + 1))
+                continue
+            raise
+    raise last_error
+
+
+async def ask_ai(prompt: str) -> str:
+    """یک تابع کمکی برای صدا زدن Gemini با شخصیت خودمونی (با محافظت در برابر محدودیت نرخ)."""
+    return await generate_content_safe(prompt)
 
 
 def is_greeting(text: str) -> bool:
@@ -105,6 +284,242 @@ def find_learned_match(text: str):
     return None
 
 
+# ---------- تقویم شمسی و شمارش معکوس مناسبت‌ها ----------
+
+def next_jalali_occurrence(month: int, day: int) -> date:
+    """نزدیک‌ترین تاریخ میلادیِ آینده (یا امروز) که معادل این روز/ماه شمسیه."""
+    today_g = date.today()
+    j_year = jdatetime.date.today().year
+    candidate = jdatetime.date(j_year, month, day).togregorian()
+    if candidate < today_g:
+        candidate = jdatetime.date(j_year + 1, month, day).togregorian()
+    return candidate
+
+
+def get_next_chaharshanbe_suri() -> date:
+    """آخرین چهارشنبه‌ی قبل از نوروز؛ چون روز ثابتی در تقویم شمسی نیست، نسبت به نوروز حساب می‌شه."""
+    today_g = date.today()
+    j_year = jdatetime.date.today().year
+    candidates = []
+    for y in (j_year, j_year + 1):
+        nowruz_g = jdatetime.date(y, 1, 1).togregorian()
+        offset = (nowruz_g.weekday() - 2) % 7  # سه‌شنبه=1، چهارشنبه=2 در weekday پایتون
+        if offset == 0:
+            offset = 7
+        candidates.append(nowruz_g - timedelta(days=offset))
+    future_candidates = [c for c in candidates if c >= today_g]
+    return min(future_candidates) if future_candidates else min(candidates)
+
+
+def days_until(target: date) -> int:
+    return (target - date.today()).days
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    j_today = jdatetime.date.today()
+    weekday_fa = PERSIAN_WEEKDAYS[date.today().weekday()]
+    month_fa = PERSIAN_MONTHS[j_today.month - 1]
+    text = (
+        f"📅 امروز {weekday_fa}، {fa_num(j_today.day)} {month_fa} {fa_num(j_today.year)} هست.\n"
+        f"(میلادی: {date.today().strftime('%Y-%m-%d')})"
+    )
+    await update.message.reply_text(text)
+
+
+async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today_g = date.today()
+    nowruz_g = next_jalali_occurrence(1, 1)
+    sizdah_g = next_jalali_occurrence(1, 13)
+    yalda_g = next_jalali_occurrence(10, 1)  # نمادِ شب یلدا (شامگاه قبلش)
+    chaharshanbe_g = get_next_chaharshanbe_suri()
+
+    occasions = [
+        ("🎉 نوروز", nowruz_g),
+        ("🔥 چهارشنبه‌سوری", chaharshanbe_g),
+        ("🌳 سیزده‌به‌در", sizdah_g),
+        ("🍉 شب یلدا", yalda_g),
+    ]
+    occasions.sort(key=lambda x: x[1])
+
+    lines = []
+    for name, target in occasions:
+        d = days_until(target)
+        if d == 0:
+            lines.append(f"{name}: امروزه! 🎊")
+        else:
+            lines.append(f"{name}: {fa_num(d)} روز دیگه")
+
+    await update.message.reply_text("⏳ **شمارش معکوس مناسبت‌ها:**\n\n" + "\n".join(lines), parse_mode="Markdown")
+
+
+# ---------- نرخ دلار و طلا ----------
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not BRSAPI_KEY:
+        await update.message.reply_text(
+            "❌ هنوز کلید قیمت‌ها تنظیم نشده.\n"
+            "یه کلید رایگان از brsapi.ir بگیر (تا ۱۵۰۰ درخواست در روز، بدون پرداخت) "
+            "و در Railway > Variables با اسم `BRSAPI_KEY` ستش کن.",
+            parse_mode="Markdown",
+        )
+        return
+
+    sent_msg = await update.message.reply_text("💰 صبر کن، نرخ لحظه‌ای رو می‌گیرم...")
+    try:
+        resp = requests.get(
+            "https://BrsApi.ir/Market/Gold_Currency.php",
+            params={"key": BRSAPI_KEY},
+            timeout=10,
+        )
+        data = resp.json()
+    except Exception as e:
+        await context.bot.edit_message_text(
+            chat_id=update.message.chat_id,
+            message_id=sent_msg.message_id,
+            text=f"❌ نتونستم به سرویس نرخ ارز وصل شم.\n`{e}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = []
+    for section_key in ("gold", "currency"):
+        items = data.get(section_key) if isinstance(data, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or item.get("name_en") or item.get("symbol") or "?"
+                price = item.get("price")
+                if price is None:
+                    continue
+                price_str = f"{price:,}" if isinstance(price, (int, float)) else str(price)
+                lines.append(f"🔸 {name}: {price_str}")
+
+    if not lines:
+        await context.bot.edit_message_text(
+            chat_id=update.message.chat_id,
+            message_id=sent_msg.message_id,
+            text=(
+                "⚠️ جواب از سرویس گرفتم ولی نتونستم قیمت‌ها رو پیدا کنم (ساختار JSON فرق داره).\n"
+                "این بخش رو برای صاحب ربات بفرست تا فیلدها رو درست کنه:\n"
+                f"`{str(data)[:500]}`"
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.edit_message_text(
+        chat_id=update.message.chat_id,
+        message_id=sent_msg.message_id,
+        text="💰 **نرخ لحظه‌ای:**\n\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+# ---------- فال حافظ ----------
+
+async def hafez_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sent_msg = await update.message.reply_text("🔮 یه نیت کن... الان برات فال می‌گیرم...")
+    try:
+        prompt = (
+            "نقش یه فال‌بین سنتی ایرانی رو بازی کن که فال حافظ می‌گیره. "
+            "یه بیت یا چند بیت واقعی و معروف از دیوان حافظ رو انتخاب و بنویس، یه خط فاصله بگذار، "
+            "و بعد یه تفسیر کوتاه، خودمونی، امیدبخش و امروزی برای نیت و زندگی کاربر از روی همون بیت بنویس. "
+            "تفسیر باید حس خوب بده ولی واقعی و طبیعی باشه، نه شعاری."
+        )
+        reply_text = await ask_ai(prompt)
+    except Exception as e:
+        reply_text = f"❌ یه خطا خوردم تو گرفتن فال.\n`{e}`"
+    await context.bot.edit_message_text(
+        chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text,
+        parse_mode="Markdown" if reply_text.startswith("❌") else None,
+    )
+
+
+# ---------- جستجوی ویکی‌پدیا ----------
+
+WIKI_LANG = "fa"  # ویکی‌پدیای فارسی؛ برای انگلیسی بشه "en"
+# تگ "ویکی" باید ابتدای پیام باشه و یه جداکننده (فاصله/دونقطه/ویرگول) قبل از عبارت جستجو بیاد
+WIKI_TRIGGER_PATTERN = re.compile(r"^ویکی[\s:،]+(.+)$")
+
+
+def wiki_search(query: str):
+    """جستجو توی ویکی‌پدیا و گرفتن خلاصه‌ی بهترین نتیجه."""
+    search_resp = requests.get(
+        f"https://{WIKI_LANG}.wikipedia.org/w/api.php",
+        params={"action": "query", "list": "search", "srsearch": query, "format": "json", "srlimit": 1},
+        timeout=10,
+    )
+    results = search_resp.json().get("query", {}).get("search", [])
+    if not results:
+        return None
+
+    title = results[0]["title"]
+    summary_resp = requests.get(
+        f"https://{WIKI_LANG}.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(title)}",
+        timeout=10,
+    )
+    summary_data = summary_resp.json()
+    extract = summary_data.get("extract") or "خلاصه‌ای پیدا نشد، ولی می‌تونی خودِ مقاله رو بخونی."
+    page_url = (
+        summary_data.get("content_urls", {}).get("desktop", {}).get("page")
+        or f"https://{WIKI_LANG}.wikipedia.org/wiki/{requests.utils.quote(title)}"
+    )
+    return {"title": title, "extract": extract, "url": page_url}
+
+
+async def do_wiki_lookup(update: Update, query: str):
+    sent_msg = await update.message.reply_text(f"📖 دارم «{query}» رو توی ویکی‌پدیا می‌گردم...")
+    try:
+        result = wiki_search(query)
+    except Exception as e:
+        await sent_msg.edit_text(f"❌ نتونستم به ویکی‌پدیا وصل شم.\n{e}")
+        return
+
+    if not result:
+        await sent_msg.edit_text(f"❌ چیزی برای «{query}» توی ویکی‌پدیا پیدا نکردم.")
+        return
+
+    text = f"📖 **{result['title']}**\n\n{result['extract']}\n\n🔗 {result['url']}"
+    await sent_msg.edit_text(text, parse_mode="Markdown")
+
+
+# دستور /wiki <عبارت> - جستجوی مستقیم با دستور
+async def wiki_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text(
+            "❌ بعد از دستور چیزی که می‌خوای جستجو کنی رو بنویس. مثلاً:\n`/wiki پایتون`",
+            parse_mode="Markdown",
+        )
+        return
+    await do_wiki_lookup(update, query)
+
+
+async def namefamily_timeout(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text="⏰ وقت تموم شد! جواب‌هاتون رو بفرستین تا ببینیم کی بیشتر و بهتر نوشته 😄",
+    )
+
+
+async def namefamily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    letter = random.choice(PERSIAN_LETTERS)
+    await update.message.reply_text(
+        f"🎲 بازی اسم فامیل شروع شد!\nحرف امتحان: **{letter}**\n"
+        "اسم، فامیل، شهر، حیوان، غذا، گل/میوه با این حرف بگید!\n"
+        "⏱ ۶۰ ثانیه وقت دارید...",
+        parse_mode="Markdown",
+    )
+    if context.job_queue:
+        context.job_queue.run_once(
+            namefamily_timeout,
+            when=60,
+            chat_id=update.message.chat_id,
+            name=f"namefamily_{update.message.chat_id}",
+        )
+
+
 # دستور /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -123,16 +538,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP_TEXT = (
     "📜 **دستورات ربات:**\n\n"
     "🔹 `/ai <متن>` - شروع صحبت با هوش مصنوعی\n"
-    "🔹 بعدش روی جواب‌های من ریپلای کن تا ادامه‌ی گفتگو یا تحلیل بگیری، لازم نیست هر بار `/ai` بنویسی\n"
+    "🔹 بعدش روی جواب‌های من ریپلای کن تا ادامه‌ی گفتگو یا تحلیل بگیری\n"
     "🔹 یه سلام ساده هم بکنی، خودم جواب می‌دم 👋\n"
     "🔹 `/nickname <اسم>` - بگو با چه اسمی صدات کنم\n"
     "🔹 `/profile` - دیدن پروفایلت (یا ریپلای رو یکی دیگه)\n"
     "🔹 `/tag` - دیدن لقب ویژه (یا ریپلای رو یکی دیگه)\n\n"
+    "🇮🇷 **بخش ایرانی:**\n"
+    "🔸 `/hafez` - فال حافظ بگیر\n"
+    "🔸 `/today` - تاریخ امروز به شمسی\n"
+    "🔸 `/countdown` - شمارش معکوس تا نوروز، چهارشنبه‌سوری، سیزده‌به‌در و یلدا\n"
+    "🔸 `/price` - نرخ لحظه‌ای دلار و طلا\n"
+    "🔸 `/wiki <عبارت>` یا بنویس «ویکی عبارت» - جستجو در ویکی‌پدیا\n\n"
     "🎮 **بازی‌ها:**\n"
     "🔸 `/game` - منوی بازی‌ها\n"
     "🔸 `/guess` - بازی حدس عدد\n"
     "🔸 `/rps` - سنگ کاغذ قیچی\n"
-    "🔸 `/math` - ریاضی سریع\n\n"
+    "🔸 `/math` - ریاضی سریع\n"
+    "🔸 `/namefamily` - بازی اسم فامیل\n"
+    "🔸 `/dooz` - بازی دوز (با دکمه)؛ بدون ریپلای یعنی با من، با ریپلای روی یکی یعنی به چالش کشیدنش\n\n"
     "👮‍♂️ **دستورات مدیریتی:**\n"
     "🔸 `/ban` - مسدود کردن کاربر (ریپلای)\n"
     "🔸 `/mute` - سکوت کاربر (ریپلای)\n"
@@ -142,7 +565,11 @@ HELP_TEXT = (
     "🔸 `/removetag` - حذف لقب کاربر (ریپلای)\n"
     "🔸 `/learn کلیدواژه | جواب` - یاد دادن یه جواب ثابت به ربات\n"
     "🔸 `/forget کلیدواژه` - فراموش کردن یه چیزی که یاد داده بودی\n"
-    "🔸 `/learned` - لیست چیزایی که ربات تا الان یاد گرفته"
+    "🔸 `/learned` - لیست چیزایی که ربات تا الان یاد گرفته\n"
+    "🔸 `/addbadword کلمه` - اضافه کردن کلمه به فیلتر فحاشی\n"
+    "🔸 `/removebadword کلمه` - حذف کلمه از فیلتر\n"
+    "🔸 `/badwords` - دیدن لیست کلمات فیلترشده\n"
+    "🔸 `/togglelinks` - روشن/خاموش کردن فیلتر لینک برای غیرادمین‌ها"
 )
 
 
@@ -160,9 +587,9 @@ async def nickname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     user_names[update.effective_user.id] = nickname[:30]
+    save_names()
     try:
-        reply_text = ask_ai(
-            f"کاربر گفت از این به بعد باهاش با اسم «{nickname[:30]}» صحبت کنیم. "
+        reply_text = await ask_ai(
             "خودمونی و باحال تاییدش کن و یه شوخی کوچیک با اسمش بکن (محترمانه)."
         )
     except Exception:
@@ -211,6 +638,8 @@ def games_keyboard():
         [InlineKeyboardButton("🔢 حدس عدد", callback_data="game_guess_start")],
         [InlineKeyboardButton("✊ سنگ کاغذ قیچی", callback_data="game_rps_menu")],
         [InlineKeyboardButton("➕ ریاضی سریع", callback_data="game_math_start")],
+        [InlineKeyboardButton("🎲 اسم فامیل", callback_data="game_namefamily_start")],
+        [InlineKeyboardButton("❌⭕ دوز", callback_data="game_dooz_start")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -283,11 +712,170 @@ def play_rps(user_choice: str) -> str:
     return f"تو: {user_fa} | من: {bot_fa}\n{result}"
 
 
+# ---------- بازی دوز (X O) با دکمه‌های شیشه‌ای ----------
+
+DOOZ_LINES = [
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),
+    (0, 4, 8), (2, 4, 6),
+]
+
+
+def check_dooz_winner(board):
+    for a, b, c in DOOZ_LINES:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    if all(cell for cell in board):
+        return "draw"
+    return None
+
+
+def dooz_minimax(board, player):
+    winner = check_dooz_winner(board)
+    if winner == "X":
+        return -1
+    if winner == "O":
+        return 1
+    if winner == "draw":
+        return 0
+
+    scores = []
+    for i in range(9):
+        if not board[i]:
+            board[i] = player
+            scores.append(dooz_minimax(board, "O" if player == "X" else "X"))
+            board[i] = ""
+    return max(scores) if player == "O" else min(scores)
+
+
+def dooz_bot_move(board):
+    """با مینی‌ماکس کامل بهترین حرکت رو پیدا می‌کنه؛ ربات هیچ‌وقت نمی‌بازه."""
+    best_score, best_moves = None, []
+    for i in range(9):
+        if not board[i]:
+            board[i] = "O"
+            score = dooz_minimax(board, "X")
+            board[i] = ""
+            if best_score is None or score > best_score:
+                best_score, best_moves = score, [i]
+            elif score == best_score:
+                best_moves.append(i)
+    return random.choice(best_moves)
+
+
+def render_dooz_board(board):
+    symbols = {"X": "❌", "O": "⭕", "": "▫️"}
+    keyboard = []
+    for row in range(3):
+        keyboard.append([
+            InlineKeyboardButton(symbols[board[row * 3 + col]], callback_data=f"dooz_move_{row * 3 + col}")
+            for col in range(3)
+        ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def start_dooz_game(chat_id: int, x_user, o_user=None):
+    board = [""] * 9
+    active_dooz_games[chat_id] = {
+        "board": board,
+        "player_x": x_user.id,
+        "player_o": o_user.id if o_user else None,
+        "x_name": get_display_name(x_user),
+        "o_name": get_display_name(o_user) if o_user else "من",
+        "turn": "X",
+    }
+    return active_dooz_games[chat_id]
+
+
+def dooz_status_text(game, finished_text=None):
+    if finished_text:
+        return finished_text
+    turn_symbol = "❌" if game["turn"] == "X" else "⭕"
+    turn_name = game["x_name"] if game["turn"] == "X" else game["o_name"]
+    return f"⭕❌ {game['x_name']} ❌ در مقابل {game['o_name']} ⭕\nنوبت {turn_symbol} ({turn_name}) هست."
+
+
+# دستور /dooz - بدون ریپلای یعنی در مقابل خودِ ربات، با ریپلای یعنی به چالش کشیدن یه کاربر
+async def dooz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    x_user = update.effective_user
+    o_user = None
+    if update.message.reply_to_message and update.message.reply_to_message.from_user.id != x_user.id:
+        o_user = update.message.reply_to_message.from_user
+
+    game = start_dooz_game(chat_id, x_user, o_user)
+    await update.message.reply_text(
+        dooz_status_text(game), reply_markup=render_dooz_board(game["board"])
+    )
+
+
+async def finish_dooz_game(query, game, winner):
+    chat_id = query.message.chat_id
+    if winner == "draw":
+        text = "🤝 مساوی شد! بازی خوبی بود."
+    elif game["player_o"] is None:
+        text = "🎉 بردی! دمت گرم، حریف سختی بودی." if winner == "X" else "😎 من بردم! یه دست دیگه می‌خوای؟ بزن /dooz"
+    else:
+        winner_name = game["x_name"] if winner == "X" else game["o_name"]
+        text = f"🎉 {winner_name} ({'❌' if winner == 'X' else '⭕'}) برد!"
+    del active_dooz_games[chat_id]
+    await query.edit_message_text(text=text, reply_markup=render_dooz_board(game["board"]))
+
+
+async def handle_dooz_move(query, context: ContextTypes.DEFAULT_TYPE, position: int):
+    chat_id = query.message.chat_id
+    game = active_dooz_games.get(chat_id)
+    if not game:
+        await query.answer("این بازی دیگه فعال نیست. با /dooz یه بازی جدید شروع کن.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    turn = game["turn"]
+    expected_player = game["player_x"] if turn == "X" else game["player_o"]
+
+    if expected_player is None or user_id != expected_player:
+        await query.answer("نوبت تو نیست! 😅", show_alert=True)
+        return
+
+    board = game["board"]
+    if board[position]:
+        await query.answer("این خونه قبلاً پر شده!", show_alert=True)
+        return
+
+    board[position] = turn
+    await query.answer()
+
+    winner = check_dooz_winner(board)
+    if winner:
+        await finish_dooz_game(query, game, winner)
+        return
+
+    game["turn"] = "O" if turn == "X" else "X"
+
+    # اگه نوبت ربات شد، خودش بلافاصله حرکت می‌کنه
+    if game["turn"] == "O" and game["player_o"] is None:
+        bot_pos = dooz_bot_move(board)
+        board[bot_pos] = "O"
+        winner = check_dooz_winner(board)
+        if winner:
+            await finish_dooz_game(query, game, winner)
+            return
+        game["turn"] = "X"
+
+    await query.edit_message_text(text=dooz_status_text(game), reply_markup=render_dooz_board(board))
+
+
 # هندلر دکمه‌های شیشه‌ای (Inline Keyboard)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
+
+    # حرکت‌های دوز خودش با متن دلخواه (مثل "نوبت تو نیست") جواب می‌ده، پس قبل از answer عمومی پردازش می‌شه
+    if data.startswith("dooz_move_"):
+        await handle_dooz_move(query, context, int(data.rsplit("_", 1)[1]))
+        return
+
+    await query.answer()
 
     if data == "ai_mode":
         await query.message.reply_text(
@@ -308,17 +896,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"➕ سریع باش: {question} = ?")
     elif data == "game_rps_menu":
         await query.message.reply_text("✊ یکی رو انتخاب کن:", reply_markup=rps_keyboard())
+    elif data == "game_namefamily_start":
+        letter = random.choice(PERSIAN_LETTERS)
+        await query.message.reply_text(
+            f"🎲 بازی اسم فامیل شروع شد!\nحرف امتحان: **{letter}**\n"
+            "اسم، فامیل، شهر، حیوان، غذا، گل/میوه با این حرف بگید!\n⏱ ۶۰ ثانیه وقت دارید...",
+            parse_mode="Markdown",
+        )
+        if context.job_queue:
+            context.job_queue.run_once(
+                namefamily_timeout,
+                when=60,
+                chat_id=query.message.chat_id,
+                name=f"namefamily_{query.message.chat_id}",
+            )
     elif data in ("rps_rock", "rps_paper", "rps_scissors"):
         result_text = play_rps(data)
         await query.message.reply_text(result_text)
+    elif data == "game_dooz_start":
+        game = start_dooz_game(query.message.chat_id, query.from_user, o_user=None)
+        await query.message.reply_text(
+            dooz_status_text(game), reply_markup=render_dooz_board(game["board"])
+        )
 
 
 # بررسی ادمین بودن کاربر در گروه
+async def is_chat_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ["creator", "administrator"]
+    except Exception:
+        return False
+
+
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if update.message.chat.type == "private":
         return False
-    member = await context.bot.get_chat_member(update.message.chat_id, update.effective_user.id)
-    return member.status in ["creator", "administrator"]
+    return await is_chat_admin(update.message.chat_id, update.effective_user.id, context)
 
 
 # دستور بن کردن (/ban)
@@ -347,6 +961,7 @@ async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_user = update.message.reply_to_message.from_user
     muted_users.add(target_user.id)
+    save_muted()
     await update.message.reply_text(f"🔇 کاربر {target_user.first_name} در حالت سکوت قرار گرفت.")
 
 
@@ -359,6 +974,7 @@ async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = update.message.reply_to_message.from_user
     if target_user.id in muted_users:
         muted_users.remove(target_user.id)
+        save_muted()
         await update.message.reply_text(f"🔊 کاربر {target_user.first_name} مجدداً اجازه ارسال پیام دارد.")
 
 
@@ -369,12 +985,14 @@ async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = update.message.reply_to_message.from_user
     user_id = target_user.id
     user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
+    save_warnings()
 
     if user_warnings[user_id] >= 3:
         try:
             await context.bot.ban_chat_member(update.message.chat_id, user_id)
             await update.message.reply_text(f"🔒 کاربر {target_user.first_name} به دلیل دریافت ۳ اخطار بن شد.")
             user_warnings[user_id] = 0
+            save_warnings()
         except Exception:
             await update.message.reply_text("❌ خطا در بن کردن کاربر اخراجی.")
     else:
@@ -399,6 +1017,7 @@ async def settag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_user = update.message.reply_to_message.from_user
     user_tags[target_user.id] = tag_text[:30]
+    save_tags()
     await update.message.reply_text(f"🏷️ از الان لقب {target_user.first_name} شد: {tag_text[:30]}")
 
 
@@ -413,6 +1032,7 @@ async def removetag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = update.message.reply_to_message.from_user
     if target_user.id in user_tags:
         del user_tags[target_user.id]
+        save_tags()
         await update.message.reply_text(f"🗑️ لقب {target_user.first_name} حذف شد.")
     else:
         await update.message.reply_text("❌ این کاربر لقبی نداشت.")
@@ -436,6 +1056,7 @@ async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هم عبارت کلیدی هم جواب لازمه.")
         return
     learned_facts[keyword] = answer
+    save_learned()
     await update.message.reply_text(f"✅ یاد گرفتم! هر وقت کسی بگه «{keyword}» این جواب رو می‌دم:\n{answer}")
 
 
@@ -447,6 +1068,7 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyword = " ".join(context.args).strip().lower()
     if keyword in learned_facts:
         del learned_facts[keyword]
+        save_learned()
         await update.message.reply_text(f"🗑️ یادمو در مورد «{keyword}» پاک کردم.")
     else:
         await update.message.reply_text("❌ چیزی با این عبارت یاد نگرفته بودم.")
@@ -459,6 +1081,77 @@ async def learned_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     keywords = "\n".join(f"🔸 {k}" for k in learned_facts)
     await update.message.reply_text(f"📚 چیزایی که یاد گرفتم:\n{keywords}")
+
+
+# ---------- ضد اسپم و فحاشی ----------
+
+# دستور /addbadword - اضافه کردن یه کلمه به لیست فیلتر (فقط ادمین)
+async def addbadword_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    word = " ".join(context.args).strip().lower()
+    if not word:
+        await update.message.reply_text(
+            "❌ بعد از دستور کلمه رو بنویس. مثلاً:\n`/addbadword کلمه`", parse_mode="Markdown"
+        )
+        return
+    bad_words.add(word)
+    save_badwords()
+    await update.message.reply_text(f"✅ از این به بعد پیام‌های شامل «{word}» حذف می‌شن و اخطار می‌گیرن.")
+
+
+# دستور /removebadword - حذف یه کلمه از لیست فیلتر (فقط ادمین)
+async def removebadword_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    word = " ".join(context.args).strip().lower()
+    if word in bad_words:
+        bad_words.discard(word)
+        save_badwords()
+        await update.message.reply_text(f"🗑️ «{word}» از لیست فیلتر حذف شد.")
+    else:
+        await update.message.reply_text("❌ این کلمه توی لیست فیلتر نبود.")
+
+
+# دستور /badwords - دیدن لیست کلمات فیلترشده (فقط ادمین)
+async def badwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    if not bad_words:
+        await update.message.reply_text("📭 لیست فیلتر فعلاً خالیه. با `/addbadword` کلمه اضافه کن.", parse_mode="Markdown")
+        return
+    await update.message.reply_text("🚫 کلمات فیلترشده:\n" + "\n".join(f"🔸 {w}" for w in bad_words))
+
+
+# دستور /togglelinks - روشن/خاموش کردن فیلتر لینک برای غیرادمین‌ها (فقط ادمین)
+async def togglelinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global link_filter_enabled
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    link_filter_enabled = not link_filter_enabled
+    save_settings()
+    state = "فعال ✅" if link_filter_enabled else "غیرفعال ❌"
+    await update.message.reply_text(f"🔗 فیلتر لینک الان {state} شد.")
+
+
+# خوش‌آمدگویی به عضو جدید گروه
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            continue  # خودِ ربات به گروه اضافه شده، نه یه عضو جدید
+        name = get_display_name(member)
+        try:
+            reply_text = await ask_ai(
+                f"یه عضو جدید به اسم {name} تازه به این گروه تلگرامی پیوست. خودمونی، گرم و کوتاه "
+                "به گروه خوش‌آمد بگو و یه شوخی کوچیک و دوستانه بکن."
+            )
+        except Exception:
+            reply_text = f"به گروه خوش اومدی {name} جون! 🎉"
+        await update.message.reply_text(reply_text)
 
 
 # پردازش دستور متنی هوش مصنوعی (/ai)
@@ -476,7 +1169,7 @@ async def ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text("🤔 صبر کن یه لحظه فکر کنم...")
     try:
         prompt = f"{history_ctx}کاربر به اسم {name} الان این رو پرسید/گفت:\n{user_prompt}"
-        reply_text = ask_ai(prompt)
+        reply_text = await ask_ai(prompt)
         await context.bot.edit_message_text(
             chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text
         )
@@ -506,11 +1199,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         img = PIL.Image.open(file_path)
         caption = update.message.caption if update.message.caption else "این تصویر را تحلیل کن"
-        response = client.models.generate_content(
-            model=MODEL_NAME, contents=[caption, img], config=GENERATE_CONFIG
-        )
+        reply_text = await generate_content_safe([caption, img])
         await context.bot.edit_message_text(
-            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=response.text
+            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text
         )
     except Exception as e:
         await context.bot.edit_message_text(
@@ -538,10 +1229,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # ۲. ثبت پیام در حافظه‌ی کوتاه‌مدت (برای تحلیل بهتر در ادامه‌ی گفتگو)
+    # ۲. ضد اسپم: لینک مشکوک، کلمات فیلترشده، یا پیام‌های زیاد در زمان کوتاه (برای غیرادمین‌ها)
+    if update.message.chat.type != "private" and not await is_chat_admin(chat_id, user_id, context):
+        name = get_display_name(update.effective_user)
+
+        if link_filter_enabled and URL_PATTERN.search(text):
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(chat_id, f"🚫 {name} جون، فرستادن لینک توی این گروه مجاز نیست.")
+            return
+
+        text_lower = text.lower()
+        if any(bad in text_lower for bad in bad_words):
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
+            save_warnings()
+            await context.bot.send_message(
+                chat_id,
+                f"🚫 {name} این کلمه توی گروه مجاز نیست! اخطار گرفتی ({user_warnings[user_id]}/3)",
+            )
+            if user_warnings[user_id] >= 3:
+                try:
+                    await context.bot.ban_chat_member(chat_id, user_id)
+                    await context.bot.send_message(chat_id, f"🔒 {name} به دلیل ۳ اخطار بن شد.")
+                    user_warnings[user_id] = 0
+                    save_warnings()
+                except Exception:
+                    pass
+            return
+
+        now = time.monotonic()
+        timestamps = user_message_times.setdefault(user_id, deque(maxlen=SPAM_MESSAGE_THRESHOLD))
+        timestamps.append(now)
+        if len(timestamps) == SPAM_MESSAGE_THRESHOLD and (now - timestamps[0]) < SPAM_WINDOW_SECONDS:
+            muted_users.add(user_id)
+            save_muted()
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id,
+                f"🔇 {name} به‌خاطر ارسال پیام زیاد در زمان کوتاه، موقتاً بی‌صدا شد. "
+                "یه ادمین می‌تونه با /unmute (ریپلای) برش گردونه.",
+            )
+            return
+
+    # ۳. ثبت پیام در حافظه‌ی کوتاه‌مدت (برای تحلیل بهتر در ادامه‌ی گفتگو)
     add_to_history(user_id, text)
 
-    # ۳. اگه کاربر روی پیام خود ربات ریپلای کرده، یعنی می‌خواد باهاش چت/تحلیل کنه
+    # ۴. اگه کاربر روی پیام خود ربات ریپلای کرده، یعنی می‌خواد باهاش چت/تحلیل کنه
     reply_to = update.message.reply_to_message
     if reply_to and reply_to.from_user and reply_to.from_user.id == context.bot.id and text:
         name = get_display_name(update.effective_user)
@@ -559,7 +1301,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "خودمونی و طبیعی به این ادامه‌ی گفتگو جواب بده. اگه ازت خواست چیزی رو تحلیل کنی، "
                 "تحلیل دقیق و مفید بده."
             )
-            reply_text_ai = ask_ai(prompt)
+            reply_text_ai = await ask_ai(prompt)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=sent_msg.message_id, text=reply_text_ai
             )
@@ -572,7 +1314,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ۴. بازی حدس عدد فعاله؟
+    # ۵. بازی حدس عدد فعاله؟
     if chat_id in active_guess_games and text.lstrip("-").isdigit():
         game = active_guess_games[chat_id]
         guess = int(text)
@@ -588,7 +1330,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⬇️ کوچیک‌تره، بازم حدس بزن.")
         return
 
-    # ۵. بازی ریاضی سریع فعاله؟
+    # ۶. بازی ریاضی سریع فعاله؟
     if chat_id in active_math_games and text.lstrip("-").isdigit():
         game = active_math_games[chat_id]
         if int(text) == game["answer"]:
@@ -598,19 +1340,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ نه، اشتباهه. دوباره امتحان کن.")
         return
 
-    # ۶. چیزی هست که قبلاً یاد گرفتیم و به این پیام مربوطه؟
+    # ۷. چیزی هست که قبلاً یاد گرفتیم و به این پیام مربوطه؟
     learned_answer = find_learned_match(text)
     if learned_answer:
         await update.message.reply_text(learned_answer)
         return
 
-    # ۷. سلام و خوش‌آمد با هوش مصنوعی (اسم رو خودکار از پروفایل تلگرام می‌فهمه)
+    # ۸. تگ «ویکی» در ابتدای پیام: جستجوی خودکار در ویکی‌پدیا
+    wiki_match = WIKI_TRIGGER_PATTERN.match(text)
+    if wiki_match:
+        await do_wiki_lookup(update, wiki_match.group(1).strip())
+        return
+
+    # ۹. سلام و خوش‌آمد با هوش مصنوعی (اسم رو خودکار از پروفایل تلگرام می‌فهمه)
     if is_greeting(text):
         name = get_display_name(update.effective_user)
         tag = user_tags.get(user_id)
         tag_info = f" (لقبش: {tag})" if tag else ""
         try:
-            reply_text = ask_ai(
+            reply_text = await ask_ai(
                 f"کاربری به اسم {name}{tag_info} سلام داد. خودمونی، گرم و کوتاه جواب سلام بده "
                 "و اسمش رو هم صدا بزن، می‌تونی یه شوخی کوچیک هم بکنی."
             )
@@ -622,6 +1370,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # تابع اصلی اجرای ربات
 def main():
     print("🤖 ربات مدیریت گروه و هوش مصنوعی در حال روشن شدن است...")
+    load_persisted_state()
 
     app = Application.builder().token(TOKEN).build()
 
@@ -640,11 +1389,23 @@ def main():
     app.add_handler(CommandHandler("learn", learn_command))
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("learned", learned_command))
+    app.add_handler(CommandHandler("addbadword", addbadword_command))
+    app.add_handler(CommandHandler("removebadword", removebadword_command))
+    app.add_handler(CommandHandler("badwords", badwords_command))
+    app.add_handler(CommandHandler("togglelinks", togglelinks_command))
+    app.add_handler(CommandHandler("hafez", hafez_command))
+    app.add_handler(CommandHandler("wiki", wiki_command))
+    app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("countdown", countdown_command))
+    app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("game", game_menu))
     app.add_handler(CommandHandler("guess", guess_command))
     app.add_handler(CommandHandler("rps", rps_command))
     app.add_handler(CommandHandler("math", math_command))
+    app.add_handler(CommandHandler("dooz", dooz_command))
+    app.add_handler(CommandHandler("namefamily", namefamily_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
