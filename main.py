@@ -4,6 +4,7 @@ import json
 import random
 import uuid
 import asyncio
+import operator
 import time
 from collections import deque
 from datetime import date, timedelta
@@ -43,6 +44,13 @@ MODEL_NAME = "gemini-2.5-flash-lite"
 MIN_SECONDS_BETWEEN_CALLS = 4.2
 _request_lock = asyncio.Lock()
 _last_request_time = 0.0
+
+# هدر مشترک برای درخواست‌های HTTP (ویکی‌پدیا و بعضی API ها بدون User-Agent
+# درخواست رو رد می‌کنن یا یه صفحه‌ی خطای غیر-JSON برمی‌گردونن)
+HTTP_HEADERS = {
+    "User-Agent": "PersianTelegramBot/1.0 (https://t.me/; contact via bot admin)"
+}
+HTTP_TIMEOUT = 10
 
 # شخصیت خودمونی و باحال ربات برای همه‌ی پاسخ‌های هوش مصنوعی
 PERSONA = (
@@ -214,9 +222,11 @@ def fa_num(n) -> str:
 
 async def generate_content_safe(contents):
     """
-    صدا زدن Gemini با ۲ محافظ:
+    صدا زدن Gemini با ۳ محافظ:
     ۱. قبل از هر درخواست، اگه لازم باشه کمی صبر می‌کنه تا از سقف درخواست در دقیقه رد نشیم.
     ۲. اگه با وجود این به خطای ۴۲۹ (محدودیت) خوردیم، چندبار با فاصله بیشتر دوباره امتحان می‌کنه.
+    ۳. خودِ فراخوانی (که هم‌گام/blocking هست) رو توی یه ترد جدا اجرا می‌کنه تا حلقه‌ی
+       رویدادِ asyncio ربات قفل نشه و بقیه‌ی کاربرها هم‌زمان بتونن با ربات کار کنن.
     """
     global _last_request_time
     async with _request_lock:
@@ -228,8 +238,11 @@ async def generate_content_safe(contents):
     last_error = None
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME, contents=contents, config=GENERATE_CONFIG
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=MODEL_NAME,
+                contents=contents,
+                config=GENERATE_CONFIG,
             )
             return response.text
         except Exception as e:
@@ -366,12 +379,22 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent_msg = await update.message.reply_text("💰 صبر کن، نرخ لحظه‌ای رو می‌گیرم...")
     try:
-        resp = requests.get(
+        resp = await asyncio.to_thread(
+            requests.get,
             "https://BrsApi.ir/Market/Gold_Currency.php",
             params={"key": BRSAPI_KEY},
-            timeout=10,
+            headers=HTTP_HEADERS,
+            timeout=HTTP_TIMEOUT,
         )
+        resp.raise_for_status()
         data = resp.json()
+    except json.JSONDecodeError:
+        await context.bot.edit_message_text(
+            chat_id=update.message.chat_id,
+            message_id=sent_msg.message_id,
+            text="❌ سرویس قیمت جواب معتبری (JSON) برنگردوند. احتمالاً کلید API اشتباهه یا سرویس موقتاً قطعه.",
+        )
+        return
     except Exception as e:
         await context.bot.edit_message_text(
             chat_id=update.message.chat_id,
@@ -444,12 +467,20 @@ WIKI_TRIGGER_PATTERN = re.compile(r"^ویکی[\s:،]+(.+)$")
 
 
 def wiki_search(query: str):
-    """جستجو توی ویکی‌پدیا و گرفتن خلاصه‌ی بهترین نتیجه."""
+    """جستجو توی ویکی‌پدیا و گرفتن خلاصه‌ی بهترین نتیجه.
+
+    نکته‌ی مهم: API ویکی‌پدیا اگه بدون هدر User-Agent صدا زده بشه، ممکنه به‌جای
+    JSON یه صفحه‌ی خطا (یا پاسخ خالی) برگردونه که باعث خطای
+    "Expecting value: line 1 column 1 (char 0)" موقع پارس کردن JSON می‌شه.
+    برای همین همیشه هدر User-Agent می‌فرستیم و قبل از .json() وضعیت پاسخ رو چک می‌کنیم.
+    """
     search_resp = requests.get(
         f"https://{WIKI_LANG}.wikipedia.org/w/api.php",
         params={"action": "query", "list": "search", "srsearch": query, "format": "json", "srlimit": 1},
-        timeout=10,
+        headers=HTTP_HEADERS,
+        timeout=HTTP_TIMEOUT,
     )
+    search_resp.raise_for_status()
     results = search_resp.json().get("query", {}).get("search", [])
     if not results:
         return None
@@ -457,8 +488,10 @@ def wiki_search(query: str):
     title = results[0]["title"]
     summary_resp = requests.get(
         f"https://{WIKI_LANG}.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(title)}",
-        timeout=10,
+        headers=HTTP_HEADERS,
+        timeout=HTTP_TIMEOUT,
     )
+    summary_resp.raise_for_status()
     summary_data = summary_resp.json()
     extract = summary_data.get("extract") or "خلاصه‌ای پیدا نشد، ولی می‌تونی خودِ مقاله رو بخونی."
     page_url = (
@@ -471,9 +504,20 @@ def wiki_search(query: str):
 async def do_wiki_lookup(update: Update, query: str):
     sent_msg = await update.message.reply_text(f"📖 دارم «{query}» رو توی ویکی‌پدیا می‌گردم...")
     try:
-        result = wiki_search(query)
-    except Exception as e:
-        await sent_msg.edit_text(f"❌ نتونستم به ویکی‌پدیا وصل شم.\n{e}")
+        # درخواست‌های requests هم‌گام (blocking) هستن؛ توی ترد جدا اجراشون می‌کنیم
+        # تا حلقه‌ی asyncio ربات موقع جستجو قفل نشه.
+        result = await asyncio.to_thread(wiki_search, query)
+    except requests.exceptions.Timeout:
+        await sent_msg.edit_text("❌ ویکی‌پدیا به‌موقع جواب نداد (تایم‌اوت). دوباره امتحان کن.")
+        return
+    except requests.exceptions.RequestException as e:
+        await sent_msg.edit_text(f"❌ نتونستم به ویکی‌پدیا وصل شم.\n`{e}`")
+        return
+    except json.JSONDecodeError:
+        await sent_msg.edit_text(
+            "❌ ویکی‌پدیا یه جواب غیرمنتظره (نه JSON) برگردوند. ممکنه سرور موقتاً محدودیت گذاشته باشه، "
+            "چند لحظه دیگه دوباره امتحان کن."
+        )
         return
 
     if not result:
@@ -654,13 +698,18 @@ def start_guess_game(chat_id: int):
     active_guess_games[chat_id] = {"number": number, "attempts": 0}
 
 
+# به‌جای eval() خام (که یه ریسک امنیتیه، حتی برای عبارت‌های ساده)، از یه نگاشت
+# امن بین عملگر و تابعش استفاده می‌کنیم.
+MATH_OPERATORS = {"+": operator.add, "-": operator.sub, "*": operator.mul}
+
+
 def start_math_game(chat_id: int):
     a, b = random.randint(1, 50), random.randint(1, 50)
-    op = random.choice(["+", "-", "*"])
+    op = random.choice(list(MATH_OPERATORS))
     if op == "*":
         a, b = random.randint(1, 12), random.randint(1, 12)
     question = f"{a} {op} {b}"
-    answer = eval(f"{a}{op}{b}")
+    answer = MATH_OPERATORS[op](a, b)
     active_math_games[chat_id] = {"answer": answer, "question": question}
     return question
 
@@ -1197,7 +1246,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent_msg = await update.message.reply_text("👁️ بذار عکس رو نگاه کنم...")
     try:
-        img = PIL.Image.open(file_path)
+        img = await asyncio.to_thread(PIL.Image.open, file_path)
         caption = update.message.caption if update.message.caption else "این تصویر را تحلیل کن"
         reply_text = await generate_content_safe([caption, img])
         await context.bot.edit_message_text(
