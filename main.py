@@ -22,28 +22,37 @@ from telegram.ext import (
 )
 from google import genai
 from google.genai import types
+from groq import Groq
 import PIL.Image
 
 # دریافت توکن‌ها از بخش Variables در Railway
 TOKEN = os.getenv("TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
-BRSAPI_KEY = os.getenv("BRSAPI_KEY")  # اختیاری، فقط برای دستور /price لازمه
+GEMINI_KEY = os.getenv("GEMINI_KEY")     # فقط برای تحلیل عکس استفاده می‌شه
+GROQ_KEY = os.getenv("GROQ_KEY")         # موتور اصلیِ چت متنی (رایگان و سریع‌تر)
+BRSAPI_KEY = os.getenv("BRSAPI_KEY")     # اختیاری، فقط برای دستور /price لازمه
 
 if not TOKEN:
     raise RuntimeError("متغیر محیطی TOKEN ست نشده! آن را در Railway > Variables اضافه کنید.")
 if not GEMINI_KEY:
     raise RuntimeError("متغیر محیطی GEMINI_KEY ست نشده! آن را در Railway > Variables اضافه کنید.")
+if not GROQ_KEY:
+    raise RuntimeError("متغیر محیطی GROQ_KEY ست نشده! آن را در Railway > Variables اضافه کنید.")
 
-# تنظیمات هوش مصنوعی Gemini (SDK جدید google-genai)
+# --- Gemini: فقط برای تحلیل تصاویر (چون Groq در تیر رایگان از عکس پشتیبانی نمی‌کنه) ---
 client = genai.Client(api_key=GEMINI_KEY)
-# از flash-lite استفاده می‌کنیم چون سهمیه‌ی رایگانش بیشتره (۱۵ درخواست/دقیقه و ~۱۰۰۰ درخواست/روز
-# در مقابل ۱۰ درخواست/دقیقه و ~۲۵۰ درخواست/روز برای gemini-2.5-flash معمولی)
 MODEL_NAME = "gemini-2.5-flash-lite"
 
+# --- Groq: موتور اصلیِ چتِ متنی. رایگان، سریع (تراشه‌ی LPU) و سقف روزانه‌ی خوبی داره ---
+groq_client = Groq(api_key=GROQ_KEY)
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
 # حداقل فاصله‌ی زمانی بین درخواست‌ها (ثانیه) تا زیر سقف رایگان بمونیم و به خطای ۴۲۹ نخوریم
-MIN_SECONDS_BETWEEN_CALLS = 4.2
+MIN_SECONDS_BETWEEN_CALLS = 4.2       # برای Gemini (تحلیل عکس)
+MIN_SECONDS_BETWEEN_GROQ_CALLS = 2.2  # برای Groq (سقف رایگان: ۳۰ درخواست/دقیقه)
 _request_lock = asyncio.Lock()
 _last_request_time = 0.0
+_groq_lock = asyncio.Lock()
+_last_groq_request_time = 0.0
 
 # هدر مشترک برای درخواست‌های HTTP (ویکی‌پدیا و بعضی API ها بدون User-Agent
 # درخواست رو رد می‌کنن یا یه صفحه‌ی خطای غیر-JSON برمی‌گردونن)
@@ -255,9 +264,44 @@ async def generate_content_safe(contents):
     raise last_error
 
 
+async def generate_text_safe(prompt: str) -> str:
+    """
+    صدا زدن Groq (llama-3.3-70b) برای چتِ متنی، با همون ۳ محافظِ نسخه‌ی Gemini:
+    محدودسازی نرخ درخواست، retry روی خطای ۴۲۹، و اجرا توی ترد جدا تا رویداد ربات قفل نشه.
+    Groq با مدل‌های متنیِ Llama کار می‌کنه، نه با تصویر؛ برای عکس همچنان از Gemini استفاده می‌شه.
+    """
+    global _last_groq_request_time
+    async with _groq_lock:
+        wait = MIN_SECONDS_BETWEEN_GROQ_CALLS - (time.monotonic() - _last_groq_request_time)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_groq_request_time = time.monotonic()
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = await asyncio.to_thread(
+                groq_client.chat.completions.create,
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": PERSONA},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            message = str(e)
+            if "429" in message or "rate_limit" in message.lower():
+                await asyncio.sleep(6 * (attempt + 1))
+                continue
+            raise
+    raise last_error
+
+
 async def ask_ai(prompt: str) -> str:
-    """یک تابع کمکی برای صدا زدن Gemini با شخصیت خودمونی (با محافظت در برابر محدودیت نرخ)."""
-    return await generate_content_safe(prompt)
+    """یک تابع کمکی برای صدا زدن هوش مصنوعی (Groq) با شخصیت خودمونی و محافظت در برابر محدودیت نرخ."""
+    return await generate_text_safe(prompt)
 
 
 def is_greeting(text: str) -> bool:
