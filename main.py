@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import random
 import uuid
 import asyncio
@@ -11,7 +12,7 @@ from datetime import date, timedelta
 
 import jdatetime
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,13 +24,15 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 from groq import Groq
+from openai import OpenAI
 import PIL.Image
 
 # دریافت توکن‌ها از بخش Variables در Railway
 TOKEN = os.getenv("TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")     # فقط برای تحلیل عکس استفاده می‌شه
-GROQ_KEY = os.getenv("GROQ_KEY")         # موتور اصلیِ چت متنی (رایگان و سریع‌تر)
-BRSAPI_KEY = os.getenv("BRSAPI_KEY")     # اختیاری، فقط برای دستور /price لازمه
+GEMINI_KEY = os.getenv("GEMINI_KEY")       # سرویس سوم (پشتیبان نهایی) برای چت و عکس
+GROQ_KEY = os.getenv("GROQ_KEY")           # سرویس اول (اصلی) برای چت و عکس
+CEREBRAS_KEY = os.getenv("CEREBRAS_KEY")   # سرویس دوم (پشتیبان اول) برای چت و عکس
+BRSAPI_KEY = os.getenv("BRSAPI_KEY")       # اختیاری، فقط برای دستور /price لازمه
 
 if not TOKEN:
     raise RuntimeError("متغیر محیطی TOKEN ست نشده! آن را در Railway > Variables اضافه کنید.")
@@ -37,22 +40,73 @@ if not GEMINI_KEY:
     raise RuntimeError("متغیر محیطی GEMINI_KEY ست نشده! آن را در Railway > Variables اضافه کنید.")
 if not GROQ_KEY:
     raise RuntimeError("متغیر محیطی GROQ_KEY ست نشده! آن را در Railway > Variables اضافه کنید.")
+if not CEREBRAS_KEY:
+    raise RuntimeError("متغیر محیطی CEREBRAS_KEY ست نشده! آن را در Railway > Variables اضافه کنید.")
 
-# --- Gemini: فقط برای تحلیل تصاویر (چون Groq در تیر رایگان از عکس پشتیبانی نمی‌کنه) ---
-client = genai.Client(api_key=GEMINI_KEY)
-MODEL_NAME = "gemini-2.5-flash-lite"
+# ---------- سه سرویس هوش مصنوعی، هرکدوم با کلید و سهمیه‌ی رایگانِ جدا ----------
+# ایده: هم برای چتِ متنی و هم برای تحلیل عکس، اول سراغ Groq می‌ریم (سریع‌تره).
+# اگه Groq به سقف رایگانش خورد (خطای ۴۲۹)، خودکار میریم سراغ Cerebras، و اگه اونم پر
+# بود، آخرین تلاش رو با Gemini می‌زنیم. این‌جوری مجموع سهمیه‌ی رایگان‌مون جمع سه‌تا سرویسه.
 
-# --- Groq: موتور اصلیِ چتِ متنی. رایگان، سریع (تراشه‌ی LPU) و سقف روزانه‌ی خوبی داره ---
-groq_client = Groq(api_key=GROQ_KEY)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+client = genai.Client(api_key=GEMINI_KEY)                                   # Gemini (google-genai SDK)
+GEMINI_TEXT_MODEL = "gemini-2.5-flash-lite"
+GEMINI_VISION_MODEL = "gemini-2.5-flash-lite"
 
-# حداقل فاصله‌ی زمانی بین درخواست‌ها (ثانیه) تا زیر سقف رایگان بمونیم و به خطای ۴۲۹ نخوریم
-MIN_SECONDS_BETWEEN_CALLS = 4.2       # برای Gemini (تحلیل عکس)
-MIN_SECONDS_BETWEEN_GROQ_CALLS = 2.2  # برای Groq (سقف رایگان: ۳۰ درخواست/دقیقه)
-_request_lock = asyncio.Lock()
-_last_request_time = 0.0
-_groq_lock = asyncio.Lock()
-_last_groq_request_time = 0.0
+groq_client = Groq(api_key=GROQ_KEY)                                        # Groq (SDK اختصاصی)
+GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+cerebras_client = OpenAI(api_key=CEREBRAS_KEY, base_url="https://api.cerebras.ai/v1")  # Cerebras (API سازگار با OpenAI)
+CEREBRAS_TEXT_MODEL = "llama-3.3-70b"
+CEREBRAS_VISION_MODEL = "gemma-4-31b"
+
+# حداقل فاصله‌ی زمانی بین درخواست‌های هر سرویس (ثانیه) تا زیر سقف رایگانش بمونیم
+PROVIDER_MIN_INTERVAL = {
+    "groq": 2.2,
+    "cerebras": 1.0,
+    "gemini": 4.2,
+}
+_provider_locks = {name: asyncio.Lock() for name in PROVIDER_MIN_INTERVAL}
+_provider_last_time = {name: 0.0 for name in PROVIDER_MIN_INTERVAL}
+
+
+async def _pace(provider_name: str):
+    """قبل از صدا زدن یه سرویس، اگه لازم باشه کمی صبر می‌کنه تا از سقف نرخ رایگانش رد نشیم."""
+    async with _provider_locks[provider_name]:
+        wait = PROVIDER_MIN_INTERVAL[provider_name] - (time.monotonic() - _provider_last_time[provider_name])
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _provider_last_time[provider_name] = time.monotonic()
+
+
+def _is_rate_limited(error: Exception) -> bool:
+    message = str(error)
+    return "429" in message or "rate_limit" in message.lower() or "RESOURCE_EXHAUSTED" in message
+
+
+async def _call_with_fallback(providers: list, *args):
+    """
+    یه لیست از تابع‌های async (هرکدوم برای یه سرویس) رو به‌ترتیب امتحان می‌کنه.
+    روی خطای محدودیت نرخ (۴۲۹)، یه بار دیگه همون سرویس رو با کمی تاخیر امتحان می‌کنه؛
+    اگه بازم نشد یا خطای دیگه‌ای بود، می‌ره سراغ سرویس بعدی. فقط وقتی همه شکست بخورن خطا می‌ده.
+    """
+    last_error = None
+    for name, fn in providers:
+        for attempt in range(2):
+            try:
+                return await fn(*args)
+            except Exception as e:
+                last_error = e
+                if _is_rate_limited(e) and attempt == 0:
+                    await asyncio.sleep(3)
+                    continue
+                break
+    raise last_error
+
+# ری‌اکشن‌های ایموجیِ مجاز در تلگرام که ربات می‌تونه روی پیام کاربرها بذاره
+# (لیست کامل ایموجی‌های مجاز برای setMessageReaction توی Bot API تلگرامه)
+POSITIVE_REACTIONS = ["👍", "🔥", "🎉", "❤️", "👏", "🤝", "💯", "😁"]
+
 
 # هدر مشترک برای درخواست‌های HTTP (ویکی‌پدیا و بعضی API ها بدون User-Agent
 # درخواست رو رد می‌کنن یا یه صفحه‌ی خطای غیر-JSON برمی‌گردونن)
@@ -229,79 +283,147 @@ def fa_num(n) -> str:
     return "".join(PERSIAN_DIGITS[int(ch)] if ch.isdigit() else ch for ch in str(n))
 
 
-async def generate_content_safe(contents):
-    """
-    صدا زدن Gemini با ۳ محافظ:
-    ۱. قبل از هر درخواست، اگه لازم باشه کمی صبر می‌کنه تا از سقف درخواست در دقیقه رد نشیم.
-    ۲. اگه با وجود این به خطای ۴۲۹ (محدودیت) خوردیم، چندبار با فاصله بیشتر دوباره امتحان می‌کنه.
-    ۳. خودِ فراخوانی (که هم‌گام/blocking هست) رو توی یه ترد جدا اجرا می‌کنه تا حلقه‌ی
-       رویدادِ asyncio ربات قفل نشه و بقیه‌ی کاربرها هم‌زمان بتونن با ربات کار کنن.
-    """
-    global _last_request_time
-    async with _request_lock:
-        wait = MIN_SECONDS_BETWEEN_CALLS - (time.monotonic() - _last_request_time)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_request_time = time.monotonic()
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=MODEL_NAME,
-                contents=contents,
-                config=GENERATE_CONFIG,
-            )
-            return response.text
-        except Exception as e:
-            last_error = e
-            message = str(e)
-            if "429" in message or "RESOURCE_EXHAUSTED" in message:
-                await asyncio.sleep(6 * (attempt + 1))
-                continue
-            raise
-    raise last_error
+async def _text_via_groq(prompt: str) -> str:
+    await _pace("groq")
+    response = await asyncio.to_thread(
+        groq_client.chat.completions.create,
+        model=GROQ_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": PERSONA},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content
 
 
-async def generate_text_safe(prompt: str) -> str:
-    """
-    صدا زدن Groq (llama-3.3-70b) برای چتِ متنی، با همون ۳ محافظِ نسخه‌ی Gemini:
-    محدودسازی نرخ درخواست، retry روی خطای ۴۲۹، و اجرا توی ترد جدا تا رویداد ربات قفل نشه.
-    Groq با مدل‌های متنیِ Llama کار می‌کنه، نه با تصویر؛ برای عکس همچنان از Gemini استفاده می‌شه.
-    """
-    global _last_groq_request_time
-    async with _groq_lock:
-        wait = MIN_SECONDS_BETWEEN_GROQ_CALLS - (time.monotonic() - _last_groq_request_time)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_groq_request_time = time.monotonic()
+async def _text_via_cerebras(prompt: str) -> str:
+    await _pace("cerebras")
+    response = await asyncio.to_thread(
+        cerebras_client.chat.completions.create,
+        model=CEREBRAS_TEXT_MODEL,
+        messages=[
+            {"role": "system", "content": PERSONA},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content
 
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = await asyncio.to_thread(
-                groq_client.chat.completions.create,
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": PERSONA},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            last_error = e
-            message = str(e)
-            if "429" in message or "rate_limit" in message.lower():
-                await asyncio.sleep(6 * (attempt + 1))
-                continue
-            raise
-    raise last_error
+
+async def _text_via_gemini(prompt: str) -> str:
+    await _pace("gemini")
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_TEXT_MODEL,
+        contents=prompt,
+        config=GENERATE_CONFIG,
+    )
+    return response.text
+
+
+TEXT_PROVIDERS = [
+    ("Groq", _text_via_groq),
+    ("Cerebras", _text_via_cerebras),
+    ("Gemini", _text_via_gemini),
+]
 
 
 async def ask_ai(prompt: str) -> str:
-    """یک تابع کمکی برای صدا زدن هوش مصنوعی (Groq) با شخصیت خودمونی و محافظت در برابر محدودیت نرخ."""
-    return await generate_text_safe(prompt)
+    """
+    یه پیام رو به هوش مصنوعی می‌ده و جواب می‌گیره.
+    اول Groq رو امتحان می‌کنه (سریع‌تره)، اگه سهمیه‌ش پر شده باشه می‌ره سراغ Cerebras،
+    و اگه اونم پر بود آخرین تلاش رو با Gemini می‌زنه. یعنی سه‌تا سهمیه‌ی رایگانِ جدا
+    پشت سرِ هم پشتیبان همدیگه‌ان.
+    """
+    return await _call_with_fallback(TEXT_PROVIDERS, prompt)
+
+
+def _encode_image_b64(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+async def _image_via_groq(image_path: str, caption: str) -> str:
+    await _pace("groq")
+    b64_image = await asyncio.to_thread(_encode_image_b64, image_path)
+    response = await asyncio.to_thread(
+        groq_client.chat.completions.create,
+        model=GROQ_VISION_MODEL,
+        messages=[
+            {"role": "system", "content": PERSONA},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": caption},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                ],
+            },
+        ],
+    )
+    return response.choices[0].message.content
+
+
+async def _image_via_cerebras(image_path: str, caption: str) -> str:
+    await _pace("cerebras")
+    b64_image = await asyncio.to_thread(_encode_image_b64, image_path)
+    response = await asyncio.to_thread(
+        cerebras_client.chat.completions.create,
+        model=CEREBRAS_VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"{PERSONA}\n\n{caption}"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                ],
+            },
+        ],
+    )
+    return response.choices[0].message.content
+
+
+async def _image_via_gemini(image_path: str, caption: str) -> str:
+    await _pace("gemini")
+    img = await asyncio.to_thread(PIL.Image.open, image_path)
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=GEMINI_VISION_MODEL,
+        contents=[caption, img],
+        config=GENERATE_CONFIG,
+    )
+    return response.text
+
+
+IMAGE_PROVIDERS = [
+    ("Groq", _image_via_groq),
+    ("Cerebras", _image_via_cerebras),
+    ("Gemini", _image_via_gemini),
+]
+
+
+async def analyze_image(image_path: str, caption: str) -> str:
+    """
+    یه عکس رو برای تحلیل به هوش مصنوعی می‌ده، با همون منطقِ fallback سه‌مرحله‌ای:
+    Groq (llama-4-scout، پشتیبانِ vision) → Cerebras (gemma-4-31b) → Gemini.
+    """
+    return await _call_with_fallback(IMAGE_PROVIDERS, image_path, caption)
+
+
+async def react_to_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, emoji: str = None):
+    """
+    یه ری‌اکشن ایموجی (مثل تلگرام معمولی) روی پیام کاربر می‌ذاره.
+    اگه ایموجی مشخص نشه، یکی رندوم از لیست ری‌اکشن‌های مثبت انتخاب می‌شه.
+    توی try/except گذاشته شده چون بعضی چت‌ها یا نسخه‌های قدیمی‌تر ربات ممکنه این قابلیت رو نداشته باشن.
+    """
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji or random.choice(POSITIVE_REACTIONS))],
+        )
+    except Exception:
+        pass
+
+
 
 
 def is_greeting(text: str) -> bool:
@@ -1259,6 +1381,7 @@ async def ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     name = get_display_name(update.effective_user)
     history_ctx = get_history_context(user_id)
+    await react_to_message(context, update.message.chat_id, update.message.message_id, "👀")
     sent_msg = await update.message.reply_text("🤔 صبر کن یه لحظه فکر کنم...")
     try:
         prompt = f"{history_ctx}کاربر به اسم {name} الان این رو پرسید/گفت:\n{user_prompt}"
@@ -1290,9 +1413,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent_msg = await update.message.reply_text("👁️ بذار عکس رو نگاه کنم...")
     try:
-        img = await asyncio.to_thread(PIL.Image.open, file_path)
         caption = update.message.caption if update.message.caption else "این تصویر را تحلیل کن"
-        reply_text = await generate_content_safe([caption, img])
+        reply_text = await analyze_image(file_path, caption)
         await context.bot.edit_message_text(
             chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text
         )
@@ -1383,6 +1505,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tag = user_tags.get(user_id)
         tag_info = f" (لقبش: {tag})" if tag else ""
         history_ctx = get_history_context(user_id)
+        await react_to_message(context, chat_id, update.message.message_id, "👀")
         sent_msg = await update.message.reply_text("🤔 صبر کن یه لحظه فکر کنم...")
         try:
             previous_bot_text = reply_to.text or reply_to.caption or ""
@@ -1413,6 +1536,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         guess = int(text)
         game["attempts"] += 1
         if guess == game["number"]:
+            await react_to_message(context, chat_id, update.message.message_id, "🎉")
             await update.message.reply_text(
                 f"🎉 درست گفتی! عدد {game['number']} بود. تو {game['attempts']} بار حدس زدی، دمت گرم!"
             )
@@ -1427,6 +1551,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in active_math_games and text.lstrip("-").isdigit():
         game = active_math_games[chat_id]
         if int(text) == game["answer"]:
+            await react_to_message(context, chat_id, update.message.message_id, "👏")
             await update.message.reply_text("✅ آره درسته! خیلی سریع بودی 👏")
             del active_math_games[chat_id]
         else:
@@ -1447,6 +1572,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ۹. سلام و خوش‌آمد با هوش مصنوعی (اسم رو خودکار از پروفایل تلگرام می‌فهمه)
     if is_greeting(text):
+        await react_to_message(context, chat_id, update.message.message_id)
         name = get_display_name(update.effective_user)
         tag = user_tags.get(user_id)
         tag_info = f" (لقبش: {tag})" if tag else ""
