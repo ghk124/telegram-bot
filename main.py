@@ -10,6 +10,7 @@ import operator
 import time
 from collections import deque
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import jdatetime
 import requests
@@ -134,6 +135,7 @@ GENERATE_CONFIG = types.GenerateContentConfig(system_instruction=PERSONA)
 # این دیتاها بعد از هر ری‌استارت یا دیپلوی جدید هم حفظ می‌شن.
 user_warnings = {}
 muted_users = set()
+vip_users = set()            # user_id هایی که ادمین "عضو ویژه" کرده؛ از فیلتر لینک/فحش/اسپم معافن
 user_names = {}             # user_id -> نیک‌نیمی که خودش انتخاب کرده (اختیاری)
 user_tags = {}               # user_id -> لقب/نشان ویژه‌ای که ادمین بهش داده (مثل VIP، مدیر)
 active_guess_games = {}      # chat_id -> {"number": int, "attempts": int}
@@ -145,9 +147,19 @@ bad_words = set()            # کلماتی که ادمین برای فیلتر 
 link_filter_enabled = True   # فیلتر لینک برای غیرادمین‌ها (با /togglelinks خاموش/روشن می‌شه)
 user_message_times = {}      # user_id -> deque زمان آخرین پیام‌ها (برای تشخیص اسپم/فلود)
 
+chat_known_users = {}        # chat_id -> {user_id: display_name}  (برای /tagall - فقط کسایی که پیام دادن)
+chat_activity_counts = {}    # chat_id -> {user_id: تعداد پیام}    (برای /stats)
+chat_recent_messages = {}    # chat_id -> deque[(message_id, is_animation)]  (برای /clean و /cleangifs)
+RECENT_MESSAGES_LIMIT = 500  # چندتا از آخرین پیام‌های هر گروه رو برای پاک‌سازی به‌خاطر می‌سپاریم
+
 SPAM_WINDOW_SECONDS = 8      # اگه توی این بازه...
 SPAM_MESSAGE_THRESHOLD = 5   # ...به این تعداد پیام برسه، اسپم تشخیص داده می‌شه
 URL_PATTERN = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
+
+# اگه بخوای به‌جای پیام متنیِ "صبر کن..." یه گیف یا استیکر نشون بدی، اینا رو توی
+# Railway > Variables ست کن (اختیاری؛ اگه خالی باشن، همون پیام متنی قبلی نشون داده می‌شه):
+WAITING_STICKER_ID = os.getenv("WAITING_STICKER_ID")   # file_id یه استیکر
+WAITING_GIF_URL = os.getenv("WAITING_GIF_URL")         # لینک مستقیم یا file_id یه گیف
 
 # ---------- لایه‌ی ذخیره‌ی دائمی (اختیاری، فقط اگه DATABASE_URL ست شده باشه) ----------
 
@@ -242,6 +254,14 @@ def save_settings():
     db_save("settings", {"link_filter_enabled": link_filter_enabled})
 
 
+def save_vips():
+    db_save("vip_users", list(vip_users))
+
+
+def save_known_users():
+    db_save("chat_known_users", {str(cid): u for cid, u in chat_known_users.items()})
+
+
 def load_persisted_state():
     """اگه دیتابیس وصل باشه، همه‌ی دیتاهای ذخیره‌شده رو موقع روشن شدن ربات برمی‌گردونه."""
     global link_filter_enabled
@@ -255,12 +275,15 @@ def load_persisted_state():
     init_db()
     user_warnings.update({int(k): v for k, v in db_load("user_warnings", {}).items()})
     muted_users.update(int(u) for u in db_load("muted_users", []))
+    vip_users.update(int(u) for u in db_load("vip_users", []))
     user_names.update({int(k): v for k, v in db_load("user_names", {}).items()})
     user_tags.update({int(k): v for k, v in db_load("user_tags", {}).items()})
     learned_facts.update(db_load("learned_facts", {}))
     bad_words.update(db_load("bad_words", []))
     settings = db_load("settings", {})
     link_filter_enabled = settings.get("link_filter_enabled", True)
+    for cid, users in db_load("chat_known_users", {}).items():
+        chat_known_users[int(cid)] = {int(uid): name for uid, name in users.items()}
     print("✅ دیتای قبلی از دیتابیس بارگذاری شد.")
 
 GREETING_WORDS = {
@@ -417,6 +440,50 @@ def with_signature(text: str) -> str:
     return f"{text}{SIGNATURE_LINE}"
 
 
+async def send_waiting(message, context: ContextTypes.DEFAULT_TYPE, fallback_text: str = "🤔 صبر کن یه لحظه فکر کنم..."):
+    """
+    نشونه‌ی «در حال پردازش» رو می‌فرسته. اگه WAITING_STICKER_ID یا WAITING_GIF_URL ست شده
+    باشه، به‌جای پیام متنی، همون استیکر/گیف نشون داده می‌شه. در غیر این صورت همون متن قبلی.
+    آرگومان message هر شیءای با .chat_id و .reply_text می‌تونه باشه (پیام معمولی یا پیام
+    زیرِ یه دکمه‌ی شیشه‌ای)، تا هم از دستورها و هم از دکمه‌ها قابل استفاده باشه.
+    خروجی یه tuple برمی‌گردونه: (پیام ارسال‌شده، این‌که آیا رسانه بود یا نه) — چون رسانه رو
+    نمی‌شه با edit_message_text به متن تبدیل کرد، باید در پایان پاکش کنیم و پیام تازه بفرستیم.
+    """
+    chat_id = message.chat_id
+    if WAITING_STICKER_ID:
+        try:
+            msg = await context.bot.send_sticker(chat_id, WAITING_STICKER_ID)
+            return msg, True
+        except Exception:
+            pass
+    if WAITING_GIF_URL:
+        try:
+            msg = await context.bot.send_animation(chat_id, WAITING_GIF_URL)
+            return msg, True
+        except Exception:
+            pass
+    msg = await message.reply_text(fallback_text)
+    return msg, False
+
+
+async def finish_waiting(context: ContextTypes.DEFAULT_TYPE, chat_id: int, waiting_msg, is_media: bool, final_text: str, parse_mode: str = None):
+    """
+    نتیجه‌ی نهایی رو جای پیام «در حال پردازش» می‌ذاره.
+    اگه پیام انتظار متنی بود، مستقیم edit می‌کنیم. اگه رسانه (گیف/استیکر) بود، پاکش
+    می‌کنیم و یه پیام متنیِ جدید می‌فرستیم (چون رسانه رو نمی‌شه به متن edit کرد).
+    """
+    if is_media:
+        try:
+            await context.bot.delete_message(chat_id, waiting_msg.message_id)
+        except Exception:
+            pass
+        await context.bot.send_message(chat_id, final_text, parse_mode=parse_mode)
+    else:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=waiting_msg.message_id, text=final_text, parse_mode=parse_mode
+        )
+
+
 async def react_to_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, emoji: str = None):
     """
     یه ری‌اکشن ایموجی (مثل تلگرام معمولی) روی پیام کاربر می‌ذاره.
@@ -453,6 +520,25 @@ def add_to_history(user_id: int, text: str):
     if user_id not in user_message_history:
         user_message_history[user_id] = deque(maxlen=HISTORY_LIMIT)
     user_message_history[user_id].append(text)
+
+
+def track_group_activity(update: Update, is_animation: bool = False):
+    """
+    هر پیامی که توی یه گروه رد می‌شه رو ثبت می‌کنه، برای سه هدف:
+    ۱. /tagall بدونه کدوم کاربرها رو می‌شناسه (فقط کسایی که پیام دادن قابل تگ‌شدنن).
+    ۲. /stats بتونه فعال‌ترین اعضا رو نشون بده.
+    ۳. /clean و /cleangifs بدونن آخرین پیام‌ها/گیف‌های قابل پاک‌کردن کدوما هستن.
+    """
+    if update.message.chat.type == "private":
+        return
+    chat_id = update.message.chat_id
+    user = update.effective_user
+    if user and not user.is_bot:
+        chat_known_users.setdefault(chat_id, {})[user.id] = get_display_name(user)
+        chat_activity_counts.setdefault(chat_id, {})
+        chat_activity_counts[chat_id][user.id] = chat_activity_counts[chat_id].get(user.id, 0) + 1
+    recent = chat_recent_messages.setdefault(chat_id, deque(maxlen=RECENT_MESSAGES_LIMIT))
+    recent.append((update.message.message_id, is_animation))
 
 
 def get_history_context(user_id: int) -> str:
@@ -503,21 +589,23 @@ def days_until(target: date) -> int:
     return (target - date.today()).days
 
 
-async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_today_text() -> str:
     j_today = jdatetime.date.today()
     weekday_fa = PERSIAN_WEEKDAYS[date.today().weekday()]
     month_fa = PERSIAN_MONTHS[j_today.month - 1]
     persian_date = f"{weekday_fa}، {fa_num(j_today.day)} {month_fa} {fa_num(j_today.year)}"
-    text = (
+    return (
         f"📅 <b>امروز</b>\n"
         f"<code>{html_lib.escape(persian_date)}</code>\n"
         f"(میلادی: <code>{date.today().strftime('%Y-%m-%d')}</code>)"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
 
 
-async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_g = date.today()
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_today_text(), parse_mode="HTML")
+
+
+def build_countdown_text() -> str:
     nowruz_g = next_jalali_occurrence(1, 1)
     sizdah_g = next_jalali_occurrence(1, 13)
     yalda_g = next_jalali_occurrence(10, 1)  # نمادِ شب یلدا (شامگاه قبلش)
@@ -539,9 +627,11 @@ async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"{name}: <code>{fa_num(d)} روز دیگه</code>")
 
-    await update.message.reply_text(
-        "⏳ <b>شمارش معکوس مناسبت‌ها</b>\n\n" + "\n".join(lines), parse_mode="HTML"
-    )
+    return "⏳ <b>شمارش معکوس مناسبت‌ها</b>\n\n" + "\n".join(lines)
+
+
+async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_countdown_text(), parse_mode="HTML")
 
 
 # ---------- نرخ دلار و طلا ----------
@@ -556,7 +646,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    sent_msg = await update.message.reply_text("💰 صبر کن، نرخ لحظه‌ای رو می‌گیرم...")
+    waiting_msg, is_media = await send_waiting(update.message, context, "💰 صبر کن، نرخ لحظه‌ای رو می‌گیرم...")
     try:
         resp = await asyncio.to_thread(
             requests.get,
@@ -568,17 +658,15 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp.raise_for_status()
         data = resp.json()
     except json.JSONDecodeError:
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=sent_msg.message_id,
-            text="❌ سرویس قیمت جواب معتبری (JSON) برنگردوند. احتمالاً کلید API اشتباهه یا سرویس موقتاً قطعه.",
+        await finish_waiting(
+            context, update.message.chat_id, waiting_msg, is_media,
+            "❌ سرویس قیمت جواب معتبری (JSON) برنگردوند. احتمالاً کلید API اشتباهه یا سرویس موقتاً قطعه.",
         )
         return
     except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=sent_msg.message_id,
-            text=f"❌ نتونستم به سرویس نرخ ارز وصل شم.\n<code>{html_lib.escape(str(e))}</code>",
+        await finish_waiting(
+            context, update.message.chat_id, waiting_msg, is_media,
+            f"❌ نتونستم به سرویس نرخ ارز وصل شم.\n<code>{html_lib.escape(str(e))}</code>",
             parse_mode="HTML",
         )
         return
@@ -598,10 +686,9 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"🔸 {html_lib.escape(str(name))}: <code>{html_lib.escape(price_str)}</code>")
 
     if not lines:
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=sent_msg.message_id,
-            text=(
+        await finish_waiting(
+            context, update.message.chat_id, waiting_msg, is_media,
+            (
                 "⚠️ جواب از سرویس گرفتم ولی نتونستم قیمت‌ها رو پیدا کنم (ساختار JSON فرق داره).\n"
                 "این بخش رو برای صاحب ربات بفرست تا فیلدها رو درست کنه:\n"
                 f"<code>{html_lib.escape(str(data)[:500])}</code>"
@@ -610,10 +697,9 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await context.bot.edit_message_text(
-        chat_id=update.message.chat_id,
-        message_id=sent_msg.message_id,
-        text="💰 <b>نرخ لحظه‌ای</b>\n\n" + "\n".join(lines),
+    await finish_waiting(
+        context, update.message.chat_id, waiting_msg, is_media,
+        "💰 <b>نرخ لحظه‌ای</b>\n\n" + "\n".join(lines),
         parse_mode="HTML",
     )
 
@@ -621,7 +707,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- فال حافظ ----------
 
 async def hafez_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sent_msg = await update.message.reply_text("🔮 یه نیت کن... الان برات فال می‌گیرم...")
+    waiting_msg, is_media = await send_waiting(update.message, context, "🔮 یه نیت کن... الان برات فال می‌گیرم...")
     try:
         prompt = (
             "نقش یه فال‌بین سنتی ایرانی رو بازی کن که فال حافظ می‌گیره. "
@@ -633,10 +719,7 @@ async def hafez_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         formatted = with_signature(f"🔮 <b>فال حافظ</b>\n<blockquote>{html_lib.escape(reply_text)}</blockquote>")
     except Exception as e:
         formatted = f"❌ یه خطا خوردم تو گرفتن فال.\n<code>{html_lib.escape(str(e))}</code>"
-    await context.bot.edit_message_text(
-        chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=formatted,
-        parse_mode="HTML",
-    )
+    await finish_waiting(context, update.message.chat_id, waiting_msg, is_media, formatted, parse_mode="HTML")
 
 
 # ---------- جستجوی ویکی‌پدیا ----------
@@ -681,31 +764,33 @@ def wiki_search(query: str):
     return {"title": title, "extract": extract, "url": page_url}
 
 
-async def do_wiki_lookup(update: Update, query: str):
-    sent_msg = await update.message.reply_text(f"📖 دارم «{query}» رو توی ویکی‌پدیا می‌گردم...")
+async def do_wiki_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    waiting_msg, is_media = await send_waiting(update.message, context, f"📖 دارم «{query}» رو توی ویکی‌پدیا می‌گردم...")
+    chat_id = update.message.chat_id
     try:
         # درخواست‌های requests هم‌گام (blocking) هستن؛ توی ترد جدا اجراشون می‌کنیم
         # تا حلقه‌ی asyncio ربات موقع جستجو قفل نشه.
         result = await asyncio.to_thread(wiki_search, query)
     except requests.exceptions.Timeout:
-        await sent_msg.edit_text("❌ ویکی‌پدیا به‌موقع جواب نداد (تایم‌اوت). دوباره امتحان کن.")
+        await finish_waiting(context, chat_id, waiting_msg, is_media, "❌ ویکی‌پدیا به‌موقع جواب نداد (تایم‌اوت). دوباره امتحان کن.")
         return
     except requests.exceptions.RequestException as e:
-        await sent_msg.edit_text(f"❌ نتونستم به ویکی‌پدیا وصل شم.\n`{e}`")
+        await finish_waiting(context, chat_id, waiting_msg, is_media, f"❌ نتونستم به ویکی‌پدیا وصل شم.\n{html_lib.escape(str(e))}")
         return
     except json.JSONDecodeError:
-        await sent_msg.edit_text(
+        await finish_waiting(
+            context, chat_id, waiting_msg, is_media,
             "❌ ویکی‌پدیا یه جواب غیرمنتظره (نه JSON) برگردوند. ممکنه سرور موقتاً محدودیت گذاشته باشه، "
-            "چند لحظه دیگه دوباره امتحان کن."
+            "چند لحظه دیگه دوباره امتحان کن.",
         )
         return
 
     if not result:
-        await sent_msg.edit_text(f"❌ چیزی برای «{query}» توی ویکی‌پدیا پیدا نکردم.")
+        await finish_waiting(context, chat_id, waiting_msg, is_media, f"❌ چیزی برای «{query}» توی ویکی‌پدیا پیدا نکردم.")
         return
 
     text = f"📖 **{result['title']}**\n\n{result['extract']}\n\n🔗 {result['url']}"
-    await sent_msg.edit_text(text, parse_mode="Markdown")
+    await finish_waiting(context, chat_id, waiting_msg, is_media, text, parse_mode="Markdown")
 
 
 # دستور /wiki <عبارت> - جستجوی مستقیم با دستور
@@ -717,7 +802,7 @@ async def wiki_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
-    await do_wiki_lookup(update, query)
+    await do_wiki_lookup(update, context, query)
 
 
 async def namefamily_timeout(context: ContextTypes.DEFAULT_TYPE):
@@ -746,17 +831,48 @@ async def namefamily_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # دستور /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🤖 بخش هوش مصنوعی", callback_data="ai_mode")],
-        [InlineKeyboardButton("🎮 بازی‌ها", callback_data="games_menu")],
-        [InlineKeyboardButton("📜 راهنمای دستورات", callback_data="help_menu")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         f"سلام {get_display_name(update.effective_user)} جون! خوش اومدی 😄\n"
-        "یه گزینه انتخاب کن یا همینجوری بهم سلام کن، خودم جواب می‌دم:",
-        reply_markup=reply_markup,
+        "همه‌چیز از همین منو در دسترسه، یا همینجوری بهم سلام کن، خودم جواب می‌دم:",
+        reply_markup=main_menu_keyboard(),
     )
+
+
+def main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🤖 هوش مصنوعی", callback_data="menu_ai")],
+        [InlineKeyboardButton("🎮 بازی‌ها", callback_data="menu_games")],
+        [InlineKeyboardButton("🇮🇷 بخش ایرانی", callback_data="menu_iran")],
+        [InlineKeyboardButton("👤 پروفایل من", callback_data="menu_profile")],
+        [InlineKeyboardButton("👮‍♂️ ابزار مدیریت", callback_data="menu_admin")],
+        [InlineKeyboardButton("📜 راهنمای کامل", callback_data="menu_help")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def iran_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🔮 فال حافظ", callback_data="iran_hafez")],
+        [InlineKeyboardButton("📅 تاریخ امروز", callback_data="iran_today")],
+        [InlineKeyboardButton("⏳ شمارش معکوس", callback_data="iran_countdown")],
+        [InlineKeyboardButton("💰 نرخ ارز و طلا", callback_data="iran_price")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def admin_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📢 تگ همه", callback_data="admin_tagall")],
+        [InlineKeyboardButton("📊 آمار فعالیت", callback_data="admin_stats")],
+        [InlineKeyboardButton("🧹 پاک‌سازی پیام‌ها", callback_data="admin_clean_info")],
+        [InlineKeyboardButton("⭐️ عضو ویژه", callback_data="admin_vip_info")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+BACK_TO_MAIN_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")]])
 
 
 HELP_TEXT = (
@@ -787,6 +903,12 @@ HELP_TEXT = (
     "🔸 `/warn` - دادن اخطار (ریپلای)\n"
     "🔸 `/settag <متن>` - دادن لقب ویژه به کاربر (ریپلای) مثل VIP یا مدیر\n"
     "🔸 `/removetag` - حذف لقب کاربر (ریپلای)\n"
+    "🔸 `/addvip` - عضو ویژه کردن یه کاربر (ریپلای)؛ دیگه فیلتر لینک/فحش/اسپم روش اعمال نمی‌شه\n"
+    "🔸 `/removevip` - حذف عضو ویژه (ریپلای)\n"
+    "🔸 `/tagall [پیام]` - تگ کردن همه‌ی کسایی که ربات می‌شناسه (قبلاً پیام داده باشن)\n"
+    "🔸 `/stats` - فعال‌ترین اعضای گروه\n"
+    "🔸 `/clean <تعداد>` - پاک کردن آخرین N پیام\n"
+    "🔸 `/cleangifs <تعداد>` - پاک کردن آخرین N گیف\n"
     "🔸 `/learn کلیدواژه | جواب` - یاد دادن یه جواب ثابت به ربات\n"
     "🔸 `/forget کلیدواژه` - فراموش کردن یه چیزی که یاد داده بودی\n"
     "🔸 `/learned` - لیست چیزایی که ربات تا الان یاد گرفته\n"
@@ -799,7 +921,7 @@ HELP_TEXT = (
 
 # دستور /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=BACK_TO_MAIN_KEYBOARD)
 
 
 # دستور /nickname - کاربر می‌تونه بگه باهاش چه اسمی صداش کنیم
@@ -836,6 +958,22 @@ async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"این بنده‌خدا ({name}) هنوز لقب خاصی نداره.")
 
 
+def build_profile_text(target_user) -> str:
+    uid = target_user.id
+    name = get_display_name(target_user)
+    tag = user_tags.get(uid, "—")
+    warnings = user_warnings.get(uid, 0)
+    muted = "بله 🔇" if uid in muted_users else "خیر"
+    vip = "بله ⭐️" if uid in vip_users else "خیر"
+    return (
+        f"👤 **پروفایل {name}**\n"
+        f"🏷️ لقب: {tag}\n"
+        f"⭐️ عضو ویژه: {vip}\n"
+        f"⚠️ اخطارها: {warnings}/3\n"
+        f"🔇 بی‌صداست: {muted}"
+    )
+
+
 # دستور /profile - پروفایلی که ربات از کاربر یادشه
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user = (
@@ -843,18 +981,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message
         else update.effective_user
     )
-    uid = target_user.id
-    name = get_display_name(target_user)
-    tag = user_tags.get(uid, "—")
-    warnings = user_warnings.get(uid, 0)
-    muted = "بله 🔇" if uid in muted_users else "خیر"
-    text = (
-        f"👤 **پروفایل {name}**\n"
-        f"🏷️ لقب: {tag}\n"
-        f"⚠️ اخطارها: {warnings}/3\n"
-        f"🔇 بی‌صداست: {muted}"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(build_profile_text(target_user), parse_mode="Markdown")
 
 
 def games_keyboard():
@@ -864,6 +991,7 @@ def games_keyboard():
         [InlineKeyboardButton("➕ ریاضی سریع", callback_data="game_math_start")],
         [InlineKeyboardButton("🎲 اسم فامیل", callback_data="game_namefamily_start")],
         [InlineKeyboardButton("❌⭕ دوز", callback_data="game_dooz_start")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1105,23 +1233,76 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
+    chat_id = query.message.chat_id
 
-    if data == "ai_mode":
+    # ---------- منوی اصلی و زیرمنوها ----------
+    if data == "menu_main":
+        await query.message.reply_text("منوی اصلی:", reply_markup=main_menu_keyboard())
+    elif data == "menu_ai":
         await query.message.reply_text(
-            "🤖 برای صحبت با هوش مصنوعی بنویس:\n`/ai متن سوال یا حرفت`",
+            "🤖 برای صحبت با هوش مصنوعی بنویس:\n`/ai متن سوال یا حرفت`\n"
+            "یا فقط روی جواب‌های من ریپلای کن تا گفتگو ادامه پیدا کنه. یه سلام ساده هم بکنی خودم جواب می‌دم 👋",
+            parse_mode="Markdown",
+            reply_markup=BACK_TO_MAIN_KEYBOARD,
+        )
+    elif data == "menu_games":
+        await query.message.reply_text("🎮 کدوم بازی رو می‌خوای؟", reply_markup=games_keyboard())
+    elif data == "menu_iran":
+        await query.message.reply_text("🇮🇷 کدوم بخش رو می‌خوای؟", reply_markup=iran_menu_keyboard())
+    elif data == "menu_profile":
+        await query.message.reply_text(
+            build_profile_text(query.from_user), parse_mode="Markdown", reply_markup=BACK_TO_MAIN_KEYBOARD
+        )
+    elif data == "menu_admin":
+        await query.message.reply_text("👮‍♂️ ابزار مدیریت:", reply_markup=admin_menu_keyboard())
+    elif data == "menu_help":
+        await query.message.reply_text(HELP_TEXT, parse_mode="Markdown", reply_markup=BACK_TO_MAIN_KEYBOARD)
+
+    # ---------- بخش ایرانی ----------
+    elif data in ("iran_hafez", "iran_today", "iran_countdown", "iran_price"):
+        # این دستورها انتظار یه شیء Update با .message دارن؛ چون از دکمه صدا زده می‌شن
+        # (نه از یه دستور معمولی)، یه wrapper سبک با همون ساختار می‌سازیم.
+        fake_update = SimpleNamespace(message=query.message)
+        if data == "iran_hafez":
+            await hafez_command(fake_update, context)
+        elif data == "iran_today":
+            await today_command(fake_update, context)
+        elif data == "iran_countdown":
+            await countdown_command(fake_update, context)
+        elif data == "iran_price":
+            await price_command(fake_update, context)
+
+    # ---------- ابزار مدیریت ----------
+    elif data == "admin_tagall":
+        if not await is_chat_admin(chat_id, query.from_user.id, context):
+            await query.message.reply_text("❌ این کار مخصوص ادمین‌هاست.")
+        else:
+            await send_tagall(chat_id, context)
+    elif data == "admin_stats":
+        await query.message.reply_text(build_stats_text(chat_id), parse_mode="HTML")
+    elif data == "admin_clean_info":
+        await query.message.reply_text(
+            "🧹 برای پاک‌سازی، دستور رو مستقیم بنویس (به‌خاطر عدد دلخواه، از دکمه نمی‌شه):\n"
+            "`/clean 20` → آخرین ۲۰ پیام رو پاک می‌کنه\n"
+            "`/cleangifs 10` → فقط آخرین ۱۰ گیف رو پاک می‌کنه",
             parse_mode="Markdown",
         )
-    elif data == "help_menu":
-        await query.message.reply_text(HELP_TEXT, parse_mode="Markdown")
-    elif data == "games_menu":
-        await query.message.reply_text("🎮 کدوم بازی رو می‌خوای؟", reply_markup=games_keyboard())
+    elif data == "admin_vip_info":
+        await query.message.reply_text(
+            "⭐️ برای عضو ویژه کردن، روی پیام کاربر ریپلای کن و بنویس:\n"
+            "`/addvip` → ویژه‌ش کن (دیگه فیلتر لینک/فحش/اسپم روش اعمال نمی‌شه)\n"
+            "`/removevip` → ویژگیش رو بردار",
+            parse_mode="Markdown",
+        )
+
+    # ---------- بازی‌ها ----------
     elif data == "game_guess_start":
-        start_guess_game(query.message.chat_id)
+        start_guess_game(chat_id)
         await query.message.reply_text(
             "🔢 یه عدد بین ۱ تا ۱۰۰ تو ذهنم گذاشتم! حدس بزن چنده (فقط عدد رو بفرست)."
         )
     elif data == "game_math_start":
-        question = start_math_game(query.message.chat_id)
+        question = start_math_game(chat_id)
         await query.message.reply_text(f"➕ سریع باش: {question} = ?")
     elif data == "game_rps_menu":
         await query.message.reply_text("✊ یکی رو انتخاب کن:", reply_markup=rps_keyboard())
@@ -1136,14 +1317,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.job_queue.run_once(
                 namefamily_timeout,
                 when=60,
-                chat_id=query.message.chat_id,
-                name=f"namefamily_{query.message.chat_id}",
+                chat_id=chat_id,
+                name=f"namefamily_{chat_id}",
             )
     elif data in ("rps_rock", "rps_paper", "rps_scissors"):
         result_text = play_rps(data)
         await query.message.reply_text(result_text)
     elif data == "game_dooz_start":
-        game = start_dooz_game(query.message.chat_id, query.from_user, o_user=None)
+        game = start_dooz_game(chat_id, query.from_user, o_user=None)
         await query.message.reply_text(
             dooz_status_text(game), reply_markup=render_dooz_board(game["board"])
         )
@@ -1265,6 +1446,139 @@ async def removetag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗑️ لقب {target_user.first_name} حذف شد.")
     else:
         await update.message.reply_text("❌ این کاربر لقبی نداشت.")
+
+
+# دستور /addvip - عضو ویژه کردن یه کاربر؛ اعضای ویژه از فیلتر لینک/فحش/اسپم معاف می‌شن (فقط ادمین)
+async def addvip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ روی پیام کاربری که می‌خوای ویژه کنی ریپلای کن.")
+        return
+    target_user = update.message.reply_to_message.from_user
+    vip_users.add(target_user.id)
+    save_vips()
+    await update.message.reply_text(
+        f"⭐️ {target_user.first_name} از الان عضو ویژه‌ست و دیگه فیلتر لینک/فحش/اسپم روش اعمال نمی‌شه."
+    )
+
+
+# دستور /removevip - حذف عضو ویژه (فقط ادمین)
+async def removevip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ روی پیام کاربر مورد نظر ریپلای کن.")
+        return
+    target_user = update.message.reply_to_message.from_user
+    if target_user.id in vip_users:
+        vip_users.discard(target_user.id)
+        save_vips()
+        await update.message.reply_text(f"🗑️ {target_user.first_name} دیگه عضو ویژه نیست.")
+    else:
+        await update.message.reply_text("❌ این کاربر عضو ویژه نبود.")
+
+
+# ---------- تگ گروه، آمار فعالیت، و پاک‌سازی پیام‌ها ----------
+
+# دستور /tagall - همه‌ی کاربرهایی که ربات می‌شناسه (یعنی قبلاً توی گروه پیام دادن) رو تگ می‌کنه.
+# نکته: تلگرام به ربات‌ها اجازه‌ی گرفتن لیست کامل اعضای گروه رو نمی‌ده؛ فقط کسایی قابل تگ شدنن
+# که ربات قبلاً پیامشون رو دیده باشه.
+async def send_tagall(chat_id: int, context: ContextTypes.DEFAULT_TYPE, custom_message: str = ""):
+    known = chat_known_users.get(chat_id, {})
+    if not known:
+        await context.bot.send_message(
+            chat_id,
+            "❌ هنوز هیچ‌کسی رو نمی‌شناسم. فقط می‌تونم کسایی رو تگ کنم که قبلاً توی گروه پیام داده باشن "
+            "(تلگرام اجازه نمی‌ده لیست کامل اعضا رو از API گرفت).",
+        )
+        return
+    custom_message = custom_message or "توجه اعضا 📢"
+    mentions = [f'<a href="tg://user?id={uid}">{html_lib.escape(name)}</a>' for uid, name in known.items()]
+    CHUNK = 25  # هر پیام حداکثر ۲۵ نفر رو تگ می‌کنه تا از سقف طول پیام تلگرام رد نشیم
+    for i in range(0, len(mentions), CHUNK):
+        part = " ".join(mentions[i:i + CHUNK])
+        prefix = f"{html_lib.escape(custom_message)}\n\n" if i == 0 else ""
+        await context.bot.send_message(chat_id, prefix + part, parse_mode="HTML")
+
+
+async def tagall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    await send_tagall(update.message.chat_id, context, " ".join(context.args).strip())
+
+
+def build_stats_text(chat_id: int) -> str:
+    counts = chat_activity_counts.get(chat_id, {})
+    if not counts:
+        return "📊 هنوز آماری از این گروه ثبت نشده."
+    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    names = chat_known_users.get(chat_id, {})
+    lines = []
+    for i, (uid, count) in enumerate(top, start=1):
+        name = names.get(uid, str(uid))
+        lines.append(f"{fa_num(i)}. {html_lib.escape(name)} — <code>{fa_num(count)}</code> پیام")
+    return "📊 <b>فعال‌ترین اعضا</b> (از وقتی ربات روشن شده)\n\n" + "\n".join(lines)
+
+
+# دستور /stats - فعال‌ترین اعضای گروه رو بر اساس تعداد پیام نشون می‌ده
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_stats_text(update.message.chat_id), parse_mode="HTML")
+
+
+# دستور /clean <تعداد> - آخرین N پیام گروه رو پاک می‌کنه (فقط ادمین)
+async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ تعداد رو بعد از دستور بنویس. مثلاً:\n`/clean 20`", parse_mode="Markdown")
+        return
+    n = min(int(context.args[0]), RECENT_MESSAGES_LIMIT)
+    chat_id = update.message.chat_id
+    recent = list(chat_recent_messages.get(chat_id, deque()))
+    ids_to_delete = [mid for mid, _ in recent[-n:]]
+    deleted = 0
+    for mid in ids_to_delete:
+        try:
+            await context.bot.delete_message(chat_id, mid)
+            deleted += 1
+        except Exception:
+            pass
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id, f"🧹 {fa_num(deleted)} پیام پاک شد.")
+
+
+# دستور /cleangifs <تعداد> - فقط آخرین N گیف گروه رو پاک می‌کنه (فقط ادمین)
+async def cleangifs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ این دستور مخصوص ادمین‌هاست.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ تعداد رو بعد از دستور بنویس. مثلاً:\n`/cleangifs 10`", parse_mode="Markdown")
+        return
+    n = int(context.args[0])
+    chat_id = update.message.chat_id
+    recent = list(chat_recent_messages.get(chat_id, deque()))
+    gif_ids = [mid for mid, is_gif in recent if is_gif][-n:]
+    deleted = 0
+    for mid in gif_ids:
+        try:
+            await context.bot.delete_message(chat_id, mid)
+            deleted += 1
+        except Exception:
+            pass
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id, f"🧹 {fa_num(deleted)} گیف پاک شد.")
 
 
 # دستور /learn - یاد دادن یه جواب ثابت به ربات (فقط ادمین)
@@ -1396,23 +1710,30 @@ async def ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = get_display_name(update.effective_user)
     history_ctx = get_history_context(user_id)
     await react_to_message(context, update.message.chat_id, update.message.message_id, "👀")
-    sent_msg = await update.message.reply_text("🤔 صبر کن یه لحظه فکر کنم...")
+    waiting_msg, is_media = await send_waiting(update.message, context)
     try:
         prompt = f"{history_ctx}کاربر به اسم {name} الان این رو پرسید/گفت:\n{user_prompt}"
         reply_text = await ask_ai(prompt)
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=with_signature(reply_text)
-        )
+        await finish_waiting(context, update.message.chat_id, waiting_msg, is_media, with_signature(reply_text))
     except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=sent_msg.message_id,
-            text=f"❌ یه خطا خوردم تو گرفتن جواب از هوش مصنوعی.\n`{e}`",
-            parse_mode="Markdown",
+        await finish_waiting(
+            context, update.message.chat_id, waiting_msg, is_media,
+            f"❌ یه خطا خوردم تو گرفتن جواب از هوش مصنوعی.\n{html_lib.escape(str(e))}",
         )
 
 
 # پردازش تصاویر فرستاده شده به ربات
+# پردازش گیف‌هایی که کاربرها می‌فرستن (فقط برای ردیابی، تا /cleangifs بتونه پاکشون کنه)
+async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id in muted_users:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+    track_group_activity(update, is_animation=True)
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id in muted_users:
         try:
@@ -1421,23 +1742,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    track_group_activity(update)
     photo_file = await update.message.photo[-1].get_file()
     file_path = f"/tmp/photo_{update.effective_user.id}_{uuid.uuid4().hex}.jpg"
     await photo_file.download_to_drive(file_path)
 
-    sent_msg = await update.message.reply_text("👁️ بذار عکس رو نگاه کنم...")
+    waiting_msg, is_media = await send_waiting(update.message, context, "👁️ بذار عکس رو نگاه کنم...")
     try:
         caption = update.message.caption if update.message.caption else "این تصویر را تحلیل کن"
         reply_text = await analyze_image(file_path, caption)
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=with_signature(reply_text)
-        )
+        await finish_waiting(context, update.message.chat_id, waiting_msg, is_media, with_signature(reply_text))
     except Exception as e:
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=sent_msg.message_id,
-            text=f"❌ یه خطا خوردم تو پردازش عکس.\n`{e}`",
-            parse_mode="Markdown",
+        await finish_waiting(
+            context, update.message.chat_id, waiting_msg, is_media,
+            f"❌ یه خطا خوردم تو پردازش عکس.\n{html_lib.escape(str(e))}",
         )
     finally:
         if os.path.exists(file_path):
@@ -1459,7 +1777,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ۲. ضد اسپم: لینک مشکوک، کلمات فیلترشده، یا پیام‌های زیاد در زمان کوتاه (برای غیرادمین‌ها)
-    if update.message.chat.type != "private" and not await is_chat_admin(chat_id, user_id, context):
+    if (
+        update.message.chat.type != "private"
+        and user_id not in vip_users
+        and not await is_chat_admin(chat_id, user_id, context)
+    ):
         name = get_display_name(update.effective_user)
 
         if link_filter_enabled and URL_PATTERN.search(text):
@@ -1511,6 +1833,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ۳. ثبت پیام در حافظه‌ی کوتاه‌مدت (برای تحلیل بهتر در ادامه‌ی گفتگو)
     add_to_history(user_id, text)
+    track_group_activity(update)
 
     # ۴. اگه کاربر روی پیام خود ربات ریپلای کرده، یعنی می‌خواد باهاش چت/تحلیل کنه
     reply_to = update.message.reply_to_message
@@ -1520,7 +1843,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tag_info = f" (لقبش: {tag})" if tag else ""
         history_ctx = get_history_context(user_id)
         await react_to_message(context, chat_id, update.message.message_id, "👀")
-        sent_msg = await update.message.reply_text("🤔 صبر کن یه لحظه فکر کنم...")
+        waiting_msg, is_media = await send_waiting(update.message, context)
         try:
             previous_bot_text = reply_to.text or reply_to.caption or ""
             prompt = (
@@ -1532,16 +1855,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "تحلیل دقیق و مفید بده."
             )
             reply_text_ai = await ask_ai(prompt)
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=sent_msg.message_id, text=with_signature(reply_text_ai)
-            )
+            await finish_waiting(context, chat_id, waiting_msg, is_media, with_signature(reply_text_ai))
         except Exception as e:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=sent_msg.message_id,
-                text=f"❌ یه خطا خوردم.\n`{e}`",
-                parse_mode="Markdown",
-            )
+            await finish_waiting(context, chat_id, waiting_msg, is_media, f"❌ یه خطا خوردم.\n{html_lib.escape(str(e))}")
         return
 
     # ۵. بازی حدس عدد فعاله؟
@@ -1581,7 +1897,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ۸. تگ «ویکی» در ابتدای پیام: جستجوی خودکار در ویکی‌پدیا
     wiki_match = WIKI_TRIGGER_PATTERN.match(text)
     if wiki_match:
-        await do_wiki_lookup(update, wiki_match.group(1).strip())
+        await do_wiki_lookup(update, context, wiki_match.group(1).strip())
         return
 
     # ۹. سلام و خوش‌آمد با هوش مصنوعی (اسم رو خودکار از پروفایل تلگرام می‌فهمه)
@@ -1619,6 +1935,12 @@ def main():
     app.add_handler(CommandHandler("tag", tag_command))
     app.add_handler(CommandHandler("settag", settag_command))
     app.add_handler(CommandHandler("removetag", removetag_command))
+    app.add_handler(CommandHandler("addvip", addvip_command))
+    app.add_handler(CommandHandler("removevip", removevip_command))
+    app.add_handler(CommandHandler("tagall", tagall_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("clean", clean_command))
+    app.add_handler(CommandHandler("cleangifs", cleangifs_command))
     app.add_handler(CommandHandler("learn", learn_command))
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("learned", learned_command))
@@ -1640,6 +1962,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.ANIMATION, handle_animation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("✅ ربات بدون مشکل شبکه متصل شد! در حال شنیدن پیام‌ها... 🚀")
