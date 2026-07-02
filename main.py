@@ -2,6 +2,7 @@ import os
 import re
 import json
 import base64
+import html as html_lib
 import random
 import uuid
 import asyncio
@@ -498,11 +499,13 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     j_today = jdatetime.date.today()
     weekday_fa = PERSIAN_WEEKDAYS[date.today().weekday()]
     month_fa = PERSIAN_MONTHS[j_today.month - 1]
+    persian_date = f"{weekday_fa}، {fa_num(j_today.day)} {month_fa} {fa_num(j_today.year)}"
     text = (
-        f"📅 امروز {weekday_fa}، {fa_num(j_today.day)} {month_fa} {fa_num(j_today.year)} هست.\n"
-        f"(میلادی: {date.today().strftime('%Y-%m-%d')})"
+        f"📅 <b>امروز</b>\n"
+        f"<code>{html_lib.escape(persian_date)}</code>\n"
+        f"(میلادی: <code>{date.today().strftime('%Y-%m-%d')}</code>)"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -524,11 +527,13 @@ async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for name, target in occasions:
         d = days_until(target)
         if d == 0:
-            lines.append(f"{name}: امروزه! 🎊")
+            lines.append(f"{name}: <code>امروزه! 🎊</code>")
         else:
-            lines.append(f"{name}: {fa_num(d)} روز دیگه")
+            lines.append(f"{name}: <code>{fa_num(d)} روز دیگه</code>")
 
-    await update.message.reply_text("⏳ **شمارش معکوس مناسبت‌ها:**\n\n" + "\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(
+        "⏳ <b>شمارش معکوس مناسبت‌ها</b>\n\n" + "\n".join(lines), parse_mode="HTML"
+    )
 
 
 # ---------- نرخ دلار و طلا ----------
@@ -538,8 +543,8 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ هنوز کلید قیمت‌ها تنظیم نشده.\n"
             "یه کلید رایگان از brsapi.ir بگیر (تا ۱۵۰۰ درخواست در روز، بدون پرداخت) "
-            "و در Railway > Variables با اسم `BRSAPI_KEY` ستش کن.",
-            parse_mode="Markdown",
+            "و در Railway &gt; Variables با اسم <code>BRSAPI_KEY</code> ستش کن.",
+            parse_mode="HTML",
         )
         return
 
@@ -565,8 +570,8 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(
             chat_id=update.message.chat_id,
             message_id=sent_msg.message_id,
-            text=f"❌ نتونستم به سرویس نرخ ارز وصل شم.\n`{e}`",
-            parse_mode="Markdown",
+            text=f"❌ نتونستم به سرویس نرخ ارز وصل شم.\n<code>{html_lib.escape(str(e))}</code>",
+            parse_mode="HTML",
         )
         return
 
@@ -582,7 +587,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if price is None:
                     continue
                 price_str = f"{price:,}" if isinstance(price, (int, float)) else str(price)
-                lines.append(f"🔸 {name}: {price_str}")
+                lines.append(f"🔸 {html_lib.escape(str(name))}: <code>{html_lib.escape(price_str)}</code>")
 
     if not lines:
         await context.bot.edit_message_text(
@@ -591,17 +596,17 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "⚠️ جواب از سرویس گرفتم ولی نتونستم قیمت‌ها رو پیدا کنم (ساختار JSON فرق داره).\n"
                 "این بخش رو برای صاحب ربات بفرست تا فیلدها رو درست کنه:\n"
-                f"`{str(data)[:500]}`"
+                f"<code>{html_lib.escape(str(data)[:500])}</code>"
             ),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         return
 
     await context.bot.edit_message_text(
         chat_id=update.message.chat_id,
         message_id=sent_msg.message_id,
-        text="💰 **نرخ لحظه‌ای:**\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
+        text="💰 <b>نرخ لحظه‌ای</b>\n\n" + "\n".join(lines),
+        parse_mode="HTML",
     )
 
 
@@ -617,11 +622,12 @@ async def hafez_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "تفسیر باید حس خوب بده ولی واقعی و طبیعی باشه، نه شعاری."
         )
         reply_text = await ask_ai(prompt)
+        formatted = f"🔮 <b>فال حافظ</b>\n<blockquote>{html_lib.escape(reply_text)}</blockquote>"
     except Exception as e:
-        reply_text = f"❌ یه خطا خوردم تو گرفتن فال.\n`{e}`"
+        formatted = f"❌ یه خطا خوردم تو گرفتن فال.\n<code>{html_lib.escape(str(e))}</code>"
     await context.bot.edit_message_text(
-        chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text,
-        parse_mode="Markdown" if reply_text.startswith("❌") else None,
+        chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=formatted,
+        parse_mode="HTML",
     )
 
 
