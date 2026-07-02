@@ -409,6 +409,14 @@ async def analyze_image(image_path: str, caption: str) -> str:
     return await _call_with_fallback(IMAGE_PROVIDERS, image_path, caption)
 
 
+SIGNATURE_LINE = "\n\n✦ ⋆ ✦ ⋆ ✦"
+
+
+def with_signature(text: str) -> str:
+    """یه خط تزئینی کوچیک ته پیام‌های هوش مصنوعی اضافه می‌کنه (بدون متن، فقط برای ظاهر)."""
+    return f"{text}{SIGNATURE_LINE}"
+
+
 async def react_to_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, emoji: str = None):
     """
     یه ری‌اکشن ایموجی (مثل تلگرام معمولی) روی پیام کاربر می‌ذاره.
@@ -622,7 +630,7 @@ async def hafez_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "تفسیر باید حس خوب بده ولی واقعی و طبیعی باشه، نه شعاری."
         )
         reply_text = await ask_ai(prompt)
-        formatted = f"🔮 <b>فال حافظ</b>\n<blockquote>{html_lib.escape(reply_text)}</blockquote>"
+        formatted = with_signature(f"🔮 <b>فال حافظ</b>\n<blockquote>{html_lib.escape(reply_text)}</blockquote>")
     except Exception as e:
         formatted = f"❌ یه خطا خوردم تو گرفتن فال.\n<code>{html_lib.escape(str(e))}</code>"
     await context.bot.edit_message_text(
@@ -810,7 +818,7 @@ async def nickname_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         reply_text = f"باشه، از الان می‌گم {nickname[:30]} 😄"
-    await update.message.reply_text(reply_text)
+    await update.message.reply_text(with_signature(reply_text))
 
 
 # دستور /tag - دیدن لقب ویژه‌ی یه کاربر
@@ -1372,7 +1380,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except Exception:
             reply_text = f"به گروه خوش اومدی {name} جون! 🎉"
-        await update.message.reply_text(reply_text)
+        await update.message.reply_text(with_signature(reply_text))
 
 
 # پردازش دستور متنی هوش مصنوعی (/ai)
@@ -1393,7 +1401,7 @@ async def ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt = f"{history_ctx}کاربر به اسم {name} الان این رو پرسید/گفت:\n{user_prompt}"
         reply_text = await ask_ai(prompt)
         await context.bot.edit_message_text(
-            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text
+            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=with_signature(reply_text)
         )
     except Exception as e:
         await context.bot.edit_message_text(
@@ -1422,7 +1430,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = update.message.caption if update.message.caption else "این تصویر را تحلیل کن"
         reply_text = await analyze_image(file_path, caption)
         await context.bot.edit_message_text(
-            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=reply_text
+            chat_id=update.message.chat_id, message_id=sent_msg.message_id, text=with_signature(reply_text)
         )
     except Exception as e:
         await context.bot.edit_message_text(
@@ -1525,7 +1533,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             reply_text_ai = await ask_ai(prompt)
             await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=sent_msg.message_id, text=reply_text_ai
+                chat_id=chat_id, message_id=sent_msg.message_id, text=with_signature(reply_text_ai)
             )
         except Exception as e:
             await context.bot.edit_message_text(
@@ -1589,7 +1597,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             reply_text = f"سلام {name} جون! 👋"
-        await update.message.reply_text(reply_text)
+        await update.message.reply_text(with_signature(reply_text))
 
 
 # تابع اصلی اجرای ربات
